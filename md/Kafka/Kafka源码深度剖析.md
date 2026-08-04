@@ -888,7 +888,629 @@ flowchart TD
 
 ## 三、消费者与 Rebalance 机制
 
-<!-- SECTION: CONSUMER -->
+Kafka 消费者以**消费者组(Consumer Group)**为单位协作消费，组内分区互斥分配，成员变化通过 **Rebalance** 重新协商分区归属。Kafka 4.3.0 同时存在两套消费者组协议：经典的 **JoinGroup/SyncGroup** 协议(下称 classic)与 KIP-848 引入的 **ConsumerGroupHeartbeat** 协议(下称 modern / 新协议)。客户端通过 `group.protocol=classic|consumer` 选择，4.x 默认走新协议。本章逐层剖析客户端 poll 流程、协调器状态机、分区分配策略、服务端 GroupCoordinator 实现以及两套协议的完整 Rebalance 时序。
+
+### 一、消费者整体架构与双协议并存
+
+#### 1.1 Facade + Delegate 模式
+
+`KafkaConsumer` 是一个门面，所有公共方法都委托给 `ConsumerDelegate`：
+
+```java
+// KafkaConsumer.java:904
+@Override
+public ConsumerRecords<K, V> poll(final Duration timeout) {
+    return delegate.poll(timeout);
+}
+```
+
+`ConsumerDelegate` 有两个实现：
+- `ClassicKafkaConsumer`(`clients/src/main/java/org/apache/kafka/clients/consumer/internals/ClassicKafkaConsumer.java`)：经典协议，应用线程内同步阻塞 poll
+- `AsyncKafkaConsumer`(`clients/src/main/java/org/apache/kafka/clients/consumer/internals/AsyncKafkaConsumer.java`)：新协议，事件驱动 + 后台线程
+
+选择由 `group.protocol` 决定，默认 `consumer`(新协议)。
+
+#### 1.2 经典 vs 新协议对比
+
+| 维度 | classic | modern (KIP-848) |
+|------|---------|------------------|
+| 加入组 | JoinGroup + SyncGroup 两阶段 | 单一 `ConsumerGroupHeartbeat` 长连接流 |
+| 分配执行 | **leader 客户端**执行 assignor | **服务端**执行 assignor |
+| 心跳 | 独立的 HeartbeatRequest | 心跳即协议本身(心跳响应携带分配) |
+| Rebalance | 全组 stop-the-world | 增量、协作式，仅影响受影响成员 |
+| 客户端状态数 | 4(UNJOINED/PREPARING/COMPLETING/STABLE) | 10 |
+| leader 概念 | 有(崩溃会卡组) | 无 |
+| 4.x 默认 | 否 | 是 |
+
+#### 1.3 消费者类层级图
+
+```mermaid
+classDiagram
+    class KafkaConsumer {
+        +poll(Duration)
+        +subscribe(Collection)
+        +commitSync()
+        +wakeup()
+        -ConsumerDelegate delegate
+    }
+    class ConsumerDelegate {
+        <<interface>>
+        +poll(Duration)
+    }
+    class ClassicKafkaConsumer {
+        -ConsumerCoordinator coordinator
+        -Fetcher fetcher
+        -ConsumerNetworkClient client
+        +poll(Timer)
+        -pollForFetches(Timer)
+    }
+    class AsyncKafkaConsumer {
+        -ConsumerMembershipManager membershipManager
+        -ConsumerHeartbeatRequestManager heartbeatRequestManager
+        -ApplicationEventHandler applicationEventHandler
+        -FetchBuffer fetchBuffer
+        +poll(Duration)
+        -checkInflightPoll(Timer)
+    }
+    KafkaConsumer --> ConsumerDelegate
+    ConsumerDelegate <|.. ClassicKafkaConsumer
+    ConsumerDelegate <|.. AsyncKafkaConsumer
+```
+
+### 二、KafkaConsumer.poll() 完整流程
+
+#### 2.1 ClassicKafkaConsumer.poll 主循环
+
+`ClassicKafkaConsumer.java:647` 是经典协议的核心：
+
+```java
+// ClassicKafkaConsumer.java:647
+private ConsumerRecords<K, V> poll(final Timer timer) {
+    acquireAndEnsureOpen();           // 加锁，确保未关闭
+    try {
+        do {
+            client.maybeTriggerWakeup();
+            updateAssignmentMetadataIfNeeded(timer, false);   // 触发 rebalance / 位移
+            final Fetch<K, V> fetch = pollForFetches(timer);
+            if (!fetch.isEmpty()) {
+                // 流水化：返回数据前预发下一轮 fetch
+                if (sendFetches() > 0 || client.hasPendingRequests())
+                    client.transmitSends();
+                return interceptors.onConsume(new ConsumerRecords<>(fetch.records(), fetch.nextOffsets()));
+            }
+        } while (timer.notExpired());
+        return ConsumerRecords.empty();
+    } finally {
+        release();
+    }
+}
+```
+
+关键点：
+- `acquireAndEnsureOpen()` 使用一把可重入锁 + `wakeupDisabled` 标志实现线程安全与 wakeup 协作；`wakeup()`(`KafkaConsumer.java:1876`)由其它线程调用时若检测到锁被占用则置位 `wakeupPending`，下次 `maybeTriggerWakeup` 抛 `WakeupException`
+- `updateAssignmentMetadataIfNeeded`(`ClassicKafkaConsumer.java:695`) 内部调用 `coordinator.poll(timer, waitForJoinGroup)`，是 rebalance 的触发点
+- `pollForFetches`(`ClassicKafkaConsumer.java:706`)：先 `collectFetch` 看缓冲区是否已有数据，没有则 `sendFetches()` 后阻塞 `client.poll`，被 `fetcher.hasAvailableFetches()` 唤醒
+- 拿到数据后**立即预发下一批 fetch**(`transmitSends()`)，实现流水化
+
+#### 2.2 pollForFetches 与 Fetcher
+
+`Fetcher`(`Fetcher.java:59`) 继承 `AbstractFetch`，自身只负责构造请求与回调：
+
+```java
+// Fetcher.java:105
+public synchronized int sendFetches() {
+    final Map<Node, FetchSessionHandler.FetchRequestData> fetchRequests = prepareFetchRequests();
+    sendFetchesInternal(fetchRequests,
+        (fetchTarget, data, resp) -> synchronized (Fetcher.this) { handleFetchSuccess(...); },
+        (fetchTarget, data, err) -> synchronized (Fetcher.this) { handleFetchFailure(...); });
+    return fetchRequests.size();
+}
+```
+
+`sendFetchesInternal`(`Fetcher.java:183`) 对每个 leader 节点构造 `FetchRequest.Builder`，通过 `client.send(target, request)` 拿到 `RequestFuture<ClientResponse>`，注册 `onSuccess/onFailure`。Fetch 会话(`FetchSessionHandler`)实现 KIP-227 增量 fetch：仅传发生变化的分区，broker 维护 session 状态。
+
+`collectFetch`(`Fetcher.java:145`) 把 `fetchBuffer` 中的 `PartitionRecords` 交给 `FetchCollector`，过滤掉位移已超前的记录、应用 `ConsumerInterceptor.onConsume` 后返回。
+
+#### 2.3 ConsumerNetworkClient
+
+`ConsumerNetworkClient`(`ConsumerNetworkClient.java`)是消费者私用的网络层封装，内置一把 `ReentrantLock` + `unsent` 队列：
+
+```java
+// ConsumerNetworkClient.java:262
+public void poll(Timer timer, PollCondition pollCondition, boolean disableWakeup) {
+    firePendingCompletedRequests();
+    lock.lock();
+    try {
+        handlePendingDisconnects();
+        long pollDelayMs = trySend(timer.currentTimeMs());     // 1. 把 unsent 中已 ready 的请求真正发出
+        if (pendingCompletion.isEmpty() && (pollCondition == null || pollCondition.shouldBlock())) {
+            long pollTimeout = Math.min(timer.remainingMs(), pollDelayMs);
+            if (client.inFlightRequestCount() == 0)
+                pollTimeout = Math.min(pollTimeout, retryBackoffMs);
+            client.poll(pollTimeout, timer.currentTimeMs());   // 2. 阻塞 IO
+        } else {
+            client.poll(0, timer.currentTimeMs());
+        }
+        ...
+        trySend(timer.currentTimeMs());     // 3. poll 完成后再尝试发一波
+        failExpiredRequests(timer.currentTimeMs());
+        unsent.clean();
+    } finally { lock.unlock(); }
+    firePendingCompletedRequests();
+    metadata.maybeThrowAnyException();
+}
+```
+
+`trySend` 把 `unsent` 中目标节点已 ready 的请求通过 `NetworkClient.send` 真正发出；未 ready 的留在 `unsent` 等下次 poll。`wakeup()`(`ConsumerNetworkClient.java:188`) 通过向 `wakeupMessage` 通道写入消息触发 `client.wakeup()`，让阻塞的 `selector.poll` 立即返回。`transmitSends()`(`ConsumerNetworkClient.java:331`) 是 poll 的"轻量版"，只做 trySend 不阻塞、不抛异常、不触发 wakeup，用于 `poll()` 返回前预发请求。
+
+#### 2.4 poll 流程图
+
+```mermaid
+flowchart TD
+    A["KafkaConsumer.poll(Duration)"] --> B["delegate.poll -> Classic/Async.poll(Timer)"]
+    B --> C["acquireAndEnsureOpen 加锁"]
+    C --> D{"hasNoSubscriptionOrUserAssignment?"}
+    D -->|"是"| E["抛 IllegalStateException"]
+    D -->|"否"| F["maybeTriggerWakeup"]
+    F --> G["updateAssignmentMetadataIfNeeded<br/>coordinator.poll -> ensureActiveGroup -> joinGroupIfNeeded"]
+    G --> H["pollForFetches<br/>collectFetch / sendFetches / client.poll"]
+    H --> I{"fetch.isEmpty?"}
+    I -->|"是"| J{"timer.notExpired?"}
+    J -->|"是"| F
+    J -->|"否"| K["return ConsumerRecords.empty()"]
+    I -->|"否"| L["sendFetches / transmitSends 预发"]
+    L --> M["interceptors.onConsume"]
+    M --> N["return records"]
+```
+
+#### 2.5 AsyncKafkaConsumer 事件驱动 poll
+
+新协议消费者有**两个线程**：应用线程(执行 `poll` 与用户回调)与后台 `DefaultBackgroundThread`(发心跳、处理响应)。`AsyncKafkaConsumer.poll`(`AsyncKafkaConsumer.java:913`)把 `AsyncPollEvent` 投递给后台线程，自身只在 `fetchBuffer` 已就绪时返回数据：
+
+```java
+// AsyncKafkaConsumer.java:970
+private void checkInflightPoll(Timer timer, boolean firstPass) {
+    if (inflightPoll == null) {
+        inflightPoll = new AsyncPollEvent(calculateDeadlineMs(timer), time.milliseconds());
+        applicationEventHandler.add(inflightPoll);   // 提交后台事件
+    }
+    ...
+}
+```
+
+事件被后台线程串行处理：`validatePositions` -> `fetch` -> `collectFetch` -> 填充 `fetchBuffer`。应用线程通过 `wakeupTrigger.maybeTriggerWakeup()`(`AsyncKafkaConsumer.java:933`)在事件之间检查唤醒。这种"事件 + 单后台线程"模型避免了 classic 协议中 rebalance 与 fetch 在同一线程的阻塞耦合。
+
+### 三、消费者订阅与位移管理
+
+#### 3.1 三种订阅方式
+
+| API | 含义 | 是否触发 rebalance |
+|-----|------|--------------------|
+| `subscribe(Collection<String>)`(`KafkaConsumer.java:726`) | 集合订阅，自动分配 | 是 |
+| `subscribe(Pattern)`(`KafkaConsumer.java:771`) | 正则订阅，匹配 topic 动态加入 | 是 |
+| `assign(Collection<TopicPartition>)`(`KafkaConsumer.java:854`) | 手动分配，自由消费 | 否(不参与组) |
+
+订阅状态保存在 `SubscriptionState`：`subscriptionType`(NONE/AUTO_TOPICS/AUTO_PATTERN/USER_ASSIGNED)、`groupSubscribedTopics`、`assignment`。`subscribe` 会重置 `rebalanceNeeded = true`，下一次 `poll` 进入 `joinGroupIfNeeded`。
+
+#### 3.2 位移提交
+
+```java
+// ConsumerCoordinator.java:1142
+public boolean commitOffsetsSync(Map<TopicPartition, OffsetAndMetadata> offsets, Timer timer) { ... }
+
+// ConsumerCoordinator.java:1048
+public RequestFuture<Void> commitOffsetsAsync(Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) { ... }
+```
+
+两者最终都构造 `OffsetCommitRequest`(`group-coordinator` 处理)，目标节点是该 group 的 coordinator。自动提交由 `AutoCommitTask` 周期触发(`maybeAutoCommitOffsetsAsync`, `ConsumerCoordinator.java:1198`，间隔 `auto.commit.interval.ms`)。
+
+#### 3.3 `__consumer_offsets` 消息格式
+
+每个消费者组由 `Utils.abs(groupId.hashCode) % groupMetadataTopicPartitionCount` 选定一个 partition 作为它的协调 partition，对应 broker 即该组的 GroupCoordinator。该 partition 的消息有两类：
+
+| Key | Value | 含义 |
+|-----|-------|------|
+| `OffsetCommitKey(group, topic, partition)` | `OffsetCommitValue(offset, metadata, leaderEpoch, commitTimestamp, expireTimestamp)` | 单分区位移 |
+| `GroupMetadataKey(group)` | `GroupMetadataValue(generation, protocolType, protocol, leaderId, members..., state)` | 组元数据 |
+
+服务端 `GroupMetadataManager` 在处理 `OffsetCommit`/`JoinGroup`/`SyncGroup` 时把变更写为 record 追加到该 partition，并维护内存中的 `GroupMetadata` / 位移缓存。崩溃恢复时重放日志重建状态。
+
+### 四、消费者组协调器：AbstractCoordinator 状态机(classic)
+
+#### 4.1 字段与 MemberState
+
+`AbstractCoordinator`(`AbstractCoordinator.java:121`)是 classic 协议客户端协调器的基类，`ConsumerCoordinator` 继承它：
+
+```java
+// AbstractCoordinator.java:125
+protected enum MemberState {
+    UNJOINED,             // 不在任何组中
+    PREPARING_REBALANCE,  // 已发 JoinGroup，未收响应
+    COMPLETING_REBALANCE, // 已收 JoinGroup 响应，未收分配
+    STABLE;               // 已加入并稳定心跳
+}
+```
+
+核心字段(`AbstractCoordinator.java:160` 起)：`state`(初始 `UNJOINED`)、`generation`、`coordinator`、`heartbeatThread`、`joinFuture`、`rejoinNeeded`、`needsJoinPrepare`、`lastRebalanceStartMs`/`lastRebalanceEndMs`。
+
+#### 4.2 ensureActiveGroup -> joinGroupIfNeeded
+
+`poll()` 调用 `coordinator.poll(...)` 最终走 `ensureActiveGroup`：
+
+```java
+// AbstractCoordinator.java:413
+boolean ensureActiveGroup(final Timer timer) {
+    if (!ensureCoordinatorReady(timer)) return false;       // FindCoordinator
+    startHeartbeatThreadIfNeeded();                         // 启动心跳线程
+    return joinGroupIfNeeded(timer);                        // 进入 join 流程
+}
+```
+
+`joinGroupIfNeeded`(`AbstractCoordinator.java:463`)是核心循环：
+
+```java
+// AbstractCoordinator.java:463
+while (rejoinNeededOrPending()) {
+    if (!ensureCoordinatorReady(timer)) return false;
+    if (needsJoinPrepare) {
+        needsJoinPrepare = false;
+        if (!onJoinPrepare(timer, generation.generationId, generation.memberId)) {
+            needsJoinPrepare = true; return false;     // 等待位移提交完成
+        }
+    }
+    final RequestFuture<ByteBuffer> future = initiateJoinGroup();
+    client.poll(future, timer);                         // 阻塞直到 JoinGroup+SyncGroup 完成
+    ...
+    if (future.succeeded()) {
+        ... onJoinComplete(...); ...
+    } else { ... state = MemberState.UNJOINED; 重试 ... }
+}
+```
+
+`onJoinPrepare`(`ConsumerCoordinator.java:752`)在重平衡前调用用户 `onPartitionsRevoked` 回调、同步提交已消费位移；`onJoinComplete`(`ConsumerCoordinator.java:377`)在分配完成后调用 `onPartitionsAssigned` 并更新 `SubscriptionState.assignment`。
+
+#### 4.3 JoinGroup 请求与响应
+
+`initiateJoinGroup`(`AbstractCoordinator.java:566`)先把状态置为 `PREPARING_REBALANCE`：
+
+```java
+// AbstractCoordinator.java:571
+state = MemberState.PREPARING_REBALANCE;
+joinFuture = sendJoinGroupRequest();
+```
+
+`sendJoinGroupRequest`(`AbstractCoordinator.java:606`)构造 `JoinGroupRequestData`，包含 `groupId`、`sessionTimeoutMs`、`memberId`(初始空串)、`groupInstanceId`、`protocolType`、`protocols`(每个 assignor 的订阅元数据)、`rebalanceTimeoutMs`(= `max.poll.interval.ms`)。
+
+`JoinGroupResponseHandler`(`AbstractCoordinator.java:638`)处理响应：
+- 成功且本端是 leader：调 `onLeaderElected` 执行 `assignor.assign(...)` 得到分配结果，构造 `SyncGroupRequest`(带分配)发给 coordinator
+- 成功且本端是 follower：发空 `SyncGroupRequest`(等 leader 上报分配)
+- `REBALANCE_IN_PROGRESS`(`AbstractCoordinator.java:741`)：直接 raise，外层重试
+- `UNKNOWN_MEMBER_ID`/`ILLEGAL_GENERATION`：重置 generation 后重试
+
+成功后状态切换：
+
+```java
+// AbstractCoordinator.java:661
+state = MemberState.COMPLETING_REBALANCE;
+// ... 启用 heartbeatThread.enable()
+AbstractCoordinator.this.generation = new Generation(
+    joinResponse.data().generationId(),
+    joinResponse.data().memberId(), joinResponse.data().protocolName());
+```
+
+#### 4.4 SyncGroup 响应 -> STABLE
+
+`SyncGroupResponseHandler`(`AbstractCoordinator.java:823`)收到成功响应：
+
+```java
+// AbstractCoordinator.java:850
+state = MemberState.STABLE;
+rejoinNeeded = false;
+lastRebalanceEndMs = time.milliseconds();
+future.complete(ByteBuffer.wrap(syncResponse.data().assignment()));
+```
+
+外层 `joinGroupIfNeeded` 拿到分配后调 `onJoinComplete`，应用分配。失败时(`AbstractCoordinator.java:1064`)重置 `state = MemberState.UNJOINED` 重试。
+
+#### 4.5 classic MemberState 状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> UNJOINED
+    UNJOINED --> PREPARING_REBALANCE: initiateJoinGroup
+    PREPARING_REBALANCE --> COMPLETING_REBALANCE: JoinGroupResponse OK
+    PREPARING_REBALANCE --> UNJOINED: JoinGroup 失败/超时
+    COMPLETING_REBALANCE --> STABLE: SyncGroupResponse OK
+    COMPLETING_REBALANCE --> UNJOINED: REBALANCE_IN_PROGRESS/UNKNOWN_MEMBER
+    STABLE --> PREPARING_REBALANCE: rejoinNeeded (订阅变更/成员变更)
+    STABLE --> UNJOINED: maybeLeaveGroup
+```
+
+#### 4.6 HeartbeatThread 心跳线程
+
+`HeartbeatThread`(`AbstractCoordinator.java:1454`)是单独守护线程，周期发送 `HeartbeatRequest`：
+- 周期：`heartbeat.interval.ms`
+- session 失效：`session.timeout.ms`(coordinator 端若此时间内未收到心跳则把成员踢出)
+- 仅在 `state >= COMPLETING_REBALANCE` 时才真正发心跳(`enable()` 在 `JoinGroupResponseHandler` 中被调用)
+- 收到 `REBALANCE_IN_PROGRESS`：把 `rejoinNeeded = true`，唤醒 `joinGroupIfNeeded` 重 join
+- 收到 `UNKNOWN_MEMBER_ID`/`ILLEGAL_GENERATION`：重置 state 为 `UNJOINED`，下次 poll 重 join
+
+#### 4.7 maybeLeaveGroup
+
+`AbstractCoordinator.java:1170` 在 `close()` 时发 `LeaveGroupRequest`，coordinator 释放该成员并立即触发 rebalance(不必等 session timeout)。
+
+#### 4.8 Rebalance 触发条件
+
+| 触发源 | 客户端侧 | 服务端侧 |
+|--------|----------|----------|
+| 成员加入/离开 | subscribe/leave 触发 `rejoinNeeded=true` | DelayedJoin 收集成员 |
+| 成员超时 | poll 间隔超 `max.poll.interval.ms` | session timeout 移除成员 |
+| 订阅变化 | subscribe 新 topic，元数据变更 | leader 上报 protocols 变 |
+| 分区数变化 | 元数据刷新感知 | coordinator 推 `REBALANCE_IN_PROGRESS` |
+| coordinator 切换 | `markCoordinatorUnknown` | 新 coordinator 加载 `__consumer_offsets` |
+
+### 五、分区分配策略 ConsumerPartitionAssignor
+
+#### 5.1 接口
+
+```java
+// ConsumerPartitionAssignor.java:51
+public interface ConsumerPartitionAssignor {
+    default ByteBuffer subscriptionUserData(Set<String> topics) { return null; }
+    GroupAssignment assign(Cluster metadata, GroupSubscription groupSubscription);
+    default void onAssignment(Assignment assignment, ConsumerGroupMetadata metadata) {}
+    default List<RebalanceProtocol> supportedProtocols() { return Collections.singletonList(RebalanceProtocol.EAGER); }
+    ...
+}
+```
+
+仅 leader 成员执行 `assign`，结果随 `SyncGroupRequest` 上报，coordinator 广播给所有成员。
+
+#### 5.2 EAGER vs COOPERATIVE
+
+| 协议 | 行为 |
+|------|------|
+| `RebalanceProtocol.EAGER` | 全组撤销所有分区 -> 重新分配 -> 全组再获得。stop-the-world |
+| `RebalanceProtocol.COOPERATIVE`(KIP-429) | 增量：仅撤销被回收的分区，已保留分区不中断。需 assignor 支持(如 `CooperativeStickyAssignor`) |
+
+#### 5.3 内置实现
+
+| Assignor | 算法 | 协议 |
+|----------|------|------|
+| `RangeAssignor`(默认) | 每 topic 按 partition 数 / 成员数均分，余数给前几名 | EAGER |
+| `RoundRobinAssignor` | 全 topic partition 按字典序轮转分给成员 | EAGER |
+| `StickyAssignor` | 尽量保持上次分配，最小化迁移 | EAGER |
+| `CooperativeStickyAssignor` | Sticky 的协作版，支持增量 | COOPERATIVE |
+
+### 六、服务端 GroupCoordinator
+
+#### 6.1 分层架构
+
+Kafka 4.x 把 classic 与 modern 两套协调器合并到 `group-coordinator` 模块，分层如下：
+
+```mermaid
+flowchart TB
+    subgraph Core["KafkaApis"]
+        A["handleJoinGroupRequest<br/>handleSyncGroupRequest<br/>handleConsumerGroupHeartbeat<br/>handleOffsetCommitRequest"]
+    end
+    subgraph GC["group-coordinator"]
+        S["GroupCoordinatorService<br/>顶层服务，管理 shards"]
+        SH1["GroupCoordinatorShard #0<br/>(partition 0 of __consumer_offsets)"]
+        SH2["GroupCoordinatorShard #1<br/>(partition 1)"]
+        SHn["GroupCoordinatorShard #N"]
+        MM["GroupMetadataManager<br/>组状态机 + 写入 __consumer_offsets"]
+        CG["modern: ConsumerGroup<br/>ConsumerGroupMember"]
+        CLG["classic: GroupMetadata<br/>MemberMetadata"]
+    end
+    subgraph Store["存储"]
+        CO["__consumer_offsets topic"]
+    end
+    A --> S --> SH1 & SH2 & SHn
+    SH1 --> MM
+    MM --> CLG
+    MM --> CG
+    MM --> CO
+```
+
+- `GroupCoordinatorService`(`group-coordinator/.../GroupCoordinatorService.java`)：管理 N 个 shard，对应 `__consumer_offsets` 的 N 个 partition。请求按 `Utils.abs(groupId.hashCode) % N` 路由到对应 shard
+- `GroupCoordinatorShard`：每个 shard 负责一组 group 的状态机，处理 `onElection`(`GroupCoordinator.java:417`)/`onResignation`(`GroupCoordinator.java:432`)领导权变更，并在 `onMetadataUpdate`(`GroupCoordinator.java:443`)时感知分区数变化
+- `GroupMetadataManager`：核心业务逻辑，同时支持 classic `GroupMetadata`/`MemberMetadata` 与 modern `ConsumerGroup`/`ConsumerGroupMember`
+- `GroupCoordinator` 接口：定义全部对外方法，如 `consumerGroupDescribe`(`GroupCoordinator.java:211`)、`fetchOffsets`(`GroupCoordinator.java:281`)、`deleteGroups`(`GroupCoordinator.java:266`)、`startup`(`GroupCoordinator.java:478`)、`shutdown`(`GroupCoordinator.java:483`)
+
+#### 6.2 classic 服务端处理
+
+`JoinGroupRequest` 处理流程：
+1. 鉴权 + 路由到 group 所在 shard
+2. 加载/创建 `GroupMetadata`，状态机：`Empty -> PreparingRebalance -> AwaitingSync -> Stable`
+3. 成员加入：加入 `members` 集合，若达到 `rebalanceTimeoutMs` 或所有已知成员已加入则完成 join 阶段
+4. 选 leader(第一个成员或保留原 leader)，给所有成员回 `JoinGroupResponse`(leader 拿到全部成员的订阅元数据)
+5. 进入 `AwaitingSync`，等 leader 发 `SyncGroupRequest` 上报分配
+6. 收到 leader sync 后把分配结果广播给每个成员的 `SyncGroupResponse`，状态转 `Stable`
+
+整个 join 阶段由 `DelayedJoin`(基于 `DelayedOperationPurgatory` 时间轮)驱动，等所有成员加入或超时。`__consumer_offsets` 的写入用 produce 路径，等 ISR 确认后才回调客户端。
+
+#### 6.3 服务端 GroupMetadata 状态机(classic)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty: 组首次创建
+    Empty --> PreparingRebalance: 第一个成员 JoinGroup
+    PreparingRebalance --> AwaitingSync: 所有成员已 join 或 rebalanceTimeout
+    AwaitingSync --> Stable: leader SyncGroup 上报分配
+    Stable --> PreparingRebalance: 新成员加入/成员离开/订阅变
+    AwaitingSync --> PreparingRebalance: SyncGroup 超时/失败
+    Stable --> Dead: 组删除
+    Empty --> Dead: 末位移迁移
+```
+
+### 七、新消费者组协议(KIP-848)
+
+#### 7.1 设计动机
+
+classic 协议痛点：
+- JoinGroup/SyncGroup 两阶段、stop-the-world
+- leader 客户端崩溃会卡住整个组
+- 心跳与分配解耦，状态多
+- `max.poll.interval.ms` 失效逻辑复杂
+
+KIP-848 把**分配搬到服务端**，用一个长连接的 `ConsumerGroupHeartbeat` 流承载"心跳 + 加入 + 分配 + 确认"全部语义。
+
+#### 7.2 ConsumerGroupHeartbeatRequest
+
+请求/响应对(`ApiKeys.CONSUMER_GROUP_HEARTBEAT`, `ApiKeys.java:116`)字段：
+- **请求**：`groupId`、`memberId`、`memberEpoch`、`rackId`、`subscribedTopicNames`/`topicPartners`(订阅)、`serverAssignor`(服务端 assignor 名)、`rebalanceProtocol`、`targetAssignment` 回 ack
+- **响应**：`memberId`、`memberEpoch`、`state`(`STABLE/RECONCILING/...`)、`assignment`(分区分配)、`heartbeatIntervalMs`、`error`
+
+#### 7.3 客户端 MemberState 状态机(10 状态)
+
+`MemberState.java:27` 定义 10 个状态，转换表定义在 `MemberState.java:118` 静态块：
+
+```mermaid
+stateDiagram-v2
+    [*] --> UNSUBSCRIBED
+    UNSUBSCRIBED --> JOINING: subscribe
+    JOINING --> RECONCILING: 收到 epoch>0 + target assignment
+    RECONCILING --> ACKNOWLEDGING: 处理完回调与位移
+    ACKNOWLEDGING --> STABLE: 下次心跳 ack
+    STABLE --> RECONCILING: 收到新 target assignment
+    RECONCILING --> RECONCILING: 仍有未处理分配
+    JOINING --> FENCED: UNKNOWN_MEMBER_ID/FENCED_MEMBER_EPOCH
+    STABLE --> FENCED
+    FENCED --> JOINING: re-join
+    UNSUBSCRIBED --> PREPARE_LEAVING: close
+    STABLE --> PREPARE_LEAVING: close
+    PREPARE_LEAVING --> LEAVING: 回调完成
+    LEAVING --> UNSUBSCRIBED: heartbeat epoch=-1
+    LEAVING --> STALE: poll 超时(max.poll.interval)
+    STALE --> JOINING: 下次 poll 重新加入
+    JOINING --> FATAL: 不可恢复错误
+    STABLE --> FATAL
+    FATAL --> [*]
+```
+
+| 状态 | 触发条件 | 行为 |
+|------|----------|------|
+| `UNSUBSCRIBED` | 初始/已离开组 | 不发心跳，可提交位移 |
+| `JOINING` | 首次 subscribe 或被 fenced | 发心跳 epoch=0 直到收到 epoch>0 |
+| `RECONCILING` | 收到新 target assignment | 调用 onPartitionsRevoked/Assigned、提交位移 |
+| `ACKNOWLEDGING` | reconcile 完成 | 立即发心跳 ack，不等 interval |
+| `STABLE` | ack 完成 | 周期心跳 |
+| `FENCED` | 收到 `UNKNOWN_MEMBER_ID`/`FENCED_MEMBER_EPOCH` | 调 onPartitionsLost，转 JOINING |
+| `PREPARE_LEAVING` | close | 调回调释放分区 |
+| `LEAVING` | 准备发离开心跳 | 发心跳 epoch=-1/-2 |
+| `STALE` | `max.poll.interval.ms` 超时 | 发离开心跳，下次 poll 转 JOINING |
+| `FATAL` | 不可恢复错误 | 终止 |
+
+#### 7.4 关键客户端类
+
+| 类 | 职责 |
+|----|------|
+| `ConsumerMembershipManager`(`ConsumerMembershipManager.java`) | 维护 `MemberState`、`memberId`/`memberEpoch`、target/resolved assignment |
+| `ConsumerHeartbeatRequestManager`(`ConsumerHeartbeatRequestManager.java`) | 后台 `NetworkClientThread` 事件循环里构造并发 heartbeat |
+| `AsyncKafkaConsumer`(`AsyncKafkaConsumer.java:913`) | poll 把 `AsyncPollEvent` 投递给后台线程 |
+
+#### 7.5 服务端 ConsumerGroup / ConsumerGroupMember
+
+| 类 | 职责 |
+|----|------|
+| `ConsumerGroup`(`group-coordinator/.../modern/consumer/ConsumerGroup.java`) | modern 组状态，成员表、订阅、target/resolved assignment |
+| `ConsumerGroupMember`(`group-coordinator/.../modern/consumer/ConsumerGroupMember.java`) | 单成员状态(memberId/epoch/assignment/state) |
+| `GroupMetadataManager` 同时管理 | 通过 `ConsumerGroupMigrationPolicy` 在 classic/modern 间迁移 |
+
+服务端收到 `ConsumerGroupHeartbeatRequest`：按 `groupId` 路由到 shard -> `ConsumerGroup` 状态机推进 -> 若订阅变更触发**服务端 assignor**(`UniformAssignor` 等)重算 target assignment -> 响应带回新分配 -> 客户端 reconcile。
+
+#### 7.6 新旧协议对比(再强调)
+
+| 维度 | classic | modern |
+|------|---------|--------|
+| 状态数 | 4 | 10(更细粒度) |
+| 分配位置 | leader 客户端 | 服务端 |
+| Rebalance 单位 | 全组 | 增量，仅影响受影响成员 |
+| `max.poll.interval` | 影响整个组 | 仅影响单成员 |
+| leader 崩溃影响 | 整组卡住 | 无 leader 概念 |
+| 网络往返 | JoinGroup+SyncGroup+多次Heartbeat | 单一 heartbeat 流 |
+
+### 八、Rebalance 完整时序
+
+#### 8.1 classic 协议 rebalance 时序
+
+```mermaid
+sequenceDiagram
+    participant C1 as Consumer1 (leader)
+    participant C2 as Consumer2
+    participant GC as GroupCoordinator
+    participant CD as __consumer_offsets
+
+    Note over C1,C2: 初始已 STABLE
+    C2->>GC: 新成员 JoinGroupRequest(memberId="")
+    GC-->>C1: 推 REBALANCE_IN_PROGRESS(下次 Heartbeat/OffsetCommit 响应)
+    C1->>GC: JoinGroupRequest(protocols=订阅元数据)
+    C2->>GC: JoinGroupRequest(protocols=订阅元数据)
+    GC->>GC: 选 leader=C1, 收集成员<br/>状态 PreparingRebalance -> AwaitingSync
+    GC-->>C1: JoinGroupResponse(leader, members=[C1,C2], generation=5)
+    GC-->>C2: JoinGroupResponse(follower, generation=5)
+    C1->>C1: assignor.assign(cluster, groupSubscription)<br/>得到 {C1:[p0,p1], C2:[p2,p3]}
+    C1->>GC: SyncGroupRequest(assignment for C1+C2)
+    C2->>GC: SyncGroupRequest(empty)
+    GC->>CD: 写 GroupMetadataValue(generation=5, members, assignment)
+    GC-->>C1: SyncGroupResponse(assignment=[p0,p1])
+    GC-->>C2: SyncGroupResponse(assignment=[p2,p3])
+    C1->>C1: onPartitionsRevoked/Assigned, state=STABLE
+    C2->>C2: onPartitionsRevoked/Assigned, state=STABLE
+    loop 周期
+        C1->>GC: HeartbeatRequest
+        C2->>GC: HeartbeatRequest
+        GC-->>C1: OK
+        GC-->>C2: OK
+    end
+```
+
+#### 8.2 modern 协议 rebalance 时序
+
+```mermaid
+sequenceDiagram
+    participant C1 as Consumer1
+    participant C2 as Consumer2
+    participant GC as GroupCoordinator (server-side assignor)
+    participant CD as __consumer_offsets
+
+    C2->>GC: ConsumerGroupHeartbeat(memberId="", epoch=0, subscribe=[t])
+    GC->>GC: 创建 ConsumerGroup, 加入 C2<br/>服务端 assignor 算 target={C2:[p0,p1,p2,p3]}
+    GC->>CD: 写 ConsumerGroupMember 元数据 + target assignment
+    GC-->>C2: HeartbeatResponse(memberId=C2, epoch=1, state=RECONCILING, assignment=[p0..p3])
+    C2->>C2: state=RECONCILING, onPartitionsAssigned, 提交位移
+    C2->>GC: Heartbeat(epoch=1, ack target)
+    GC-->>C2: state=STABLE
+
+    C1->>GC: Heartbeat(memberId="", epoch=0, subscribe=[t])
+    GC->>GC: 加入 C1<br/>服务端 assignor 重算 target={C1:[p0,p1], C2:[p2,p3]}
+    GC->>CD: 写 target for C1, C2
+    GC-->>C1: state=RECONCILING, assignment=[p0,p1]
+    Note over C2: 下次心跳响应收到 state=RECONCILING, assignment=[p2,p3]<br/>仅 p0,p1 被回收
+    C1->>C1: onPartitionsAssigned, state=ACKNOWLEDGING
+    C2->>C2: onPartitionsRevoked(p0,p1), state=ACKNOWLEDGING
+    C1->>GC: Heartbeat ack
+    C2->>GC: Heartbeat ack
+    GC-->>C1: state=STABLE
+    GC-->>C2: state=STABLE
+    Note over C1,C2: C2 的 p2,p3 消费未中断(增量协作)
+```
+
+### 九、关键源码文件清单
+
+| 类别 | 文件 |
+|------|------|
+| Facade | `clients/src/main/java/org/apache/kafka/clients/consumer/KafkaConsumer.java` |
+| Classic 实现 | `clients/src/main/java/org/apache/kafka/clients/consumer/internals/ClassicKafkaConsumer.java` |
+| Modern 实现 | `clients/src/main/java/org/apache/kafka/clients/consumer/internals/AsyncKafkaConsumer.java` |
+| 网络封装 | `clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerNetworkClient.java` |
+| Fetch | `clients/src/main/java/org/apache/kafka/clients/consumer/internals/Fetcher.java`、`AbstractFetch.java`、`FetchCollector.java` |
+| Classic Coordinator | `clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java`、`ConsumerCoordinator.java` |
+| Modern 状态 | `clients/src/main/java/org/apache/kafka/clients/consumer/internals/MemberState.java`、`ConsumerMembershipManager.java`、`ConsumerHeartbeatRequestManager.java` |
+| 分配策略 | `clients/src/main/java/org/apache/kafka/clients/consumer/ConsumerPartitionAssignor.java`、`RangeAssignor`、`RoundRobinAssignor`、`StickyAssignor`、`CooperativeStickyAssignor` |
+| 服务端协调器 | `group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinator.java`、`GroupCoordinatorService.java`、`GroupCoordinatorShard.java`、`GroupMetadataManager.java` |
+| Modern 服务端 | `group-coordinator/src/main/java/org/apache/kafka/coordinator/group/modern/consumer/ConsumerGroup.java`、`ConsumerGroupMember.java` |
+| 协议 | `clients/src/main/java/org/apache/kafka/common/requests/JoinGroupRequest.java`、`SyncGroupRequest.java`、`HeartbeatRequest.java`、`ConsumerGroupHeartbeatRequest.java` |
 
 ---
 
@@ -1315,7 +1937,526 @@ public long transferFrom(FileChannel fileChannel, long position, long count) thr
 
 ## 五、Kafka 通信协议与服务端网络架构
 
-<!-- SECTION: PROTOCOL -->
+Kafka 自定义了一套基于 TCP 的二进制 RPC 协议，服务端采用经典的 **Reactor 多线程模型**(Acceptor -> Processor -> RequestChannel -> RequestHandler)，客户端用 NIO `Selector` 复用连接、`InFlightRequests` 管理飞行请求。KRaft 模式下进一步把**数据平面**与**控制平面**的监听器分离。本章剖析协议编解码、服务端 Reactor 全链路、客户端网络层、双平面分离与限流机制。
+
+### 一、通信协议总览
+
+#### 1.1 ApiKeys 枚举
+
+所有 API 在 `ApiKeys.java:47` 集中定义，每个 API 有唯一编号、最小/最大版本号、是否集群动作、是否可转发等属性：
+
+```java
+// ApiKeys.java:47
+public enum ApiKeys {
+    PRODUCE(ApiMessageType.PRODUCE),                    // 0
+    FETCH(ApiMessageType.FETCH),                        // 1
+    ...
+    OFFSET_COMMIT(ApiMessageType.OFFSET_COMMIT),        // 8
+    OFFSET_FETCH(ApiMessageType.OFFSET_FETCH),          // 9
+    ...
+    JOIN_GROUP(ApiMessageType.JOIN_GROUP),              // 11
+    HEARTBEAT(ApiMessageType.HEARTBEAT),                // 12
+    ...
+    SYNC_GROUP(ApiMessageType.SYNC_GROUP),              // 14
+    ...
+    CONSUMER_GROUP_HEARTBEAT(ApiMessageType.CONSUMER_GROUP_HEARTBEAT),  // KIP-848
+    ...
+    SHARE_GROUP_HEARTBEAT(...),
+    STREAMS_GROUP_HEARTBEAT(...);
+
+    ApiKeys(ApiMessageType messageType) { ... }                  // ApiKeys.java:176
+    ApiKeys(ApiMessageType, boolean clusterAction) { ... }       // ApiKeys.java:180
+    ApiKeys(ApiMessageType, boolean clusterAction, boolean forwardable) { ... }  // ApiKeys.java:184
+}
+```
+
+`clusterAction=true` 表示该 API 仅 controller 处理(如 `BROKER_HEARTBEAT`(`ApiKeys.java:111`)、`ALLOCATE_PRODUCER_IDS`(`ApiKeys.java:115`))，会被限制在 controller listener。`forwardable=true` 表示可由 broker 转发到 controller(如 `CREATE_TOPICS` 走 `forwardToController`)。
+
+#### 1.2 协议序列化框架
+
+Kafka 4.x 用协议编译器生成请求/响应数据类，统一基于 `Message` 接口：
+
+| 接口/类 | 文件 | 职责 |
+|---------|------|------|
+| `Message` | `clients/.../protocol/Message.java` | `write()`/`read()`/`size()`，版本化序列化 |
+| `ApiMessage` | `clients/.../protocol/ApiMessage.java` | 扩展 `Message`，附加 `apiKey()` |
+| `Readable`/`Writable` | `clients/.../protocol/Readable.java`、`Writable.java` | 底层读写接口 |
+| `ByteBufferAccessor` | `clients/.../protocol/ByteBufferAccessor.java` | 基于 ByteBuffer 的 `Readable`+`Writable` |
+| `RawTaggedField` | `clients/.../protocol/types/RawTaggedField.java` | 未知带标签字段，向前兼容 |
+| `Struct` | `clients/.../protocol/types/Struct.java` | 旧版基于 Schema 的结构化容器 |
+
+带标签字段(Tagged Field)是 KIP-482 引入的：高版本协议新增字段用 tag 标识，旧版本读取时跳过未知 tag，实现**前后向兼容**。
+
+#### 1.3 请求/响应格式
+
+每个请求由 **4 字节长度前缀 + 请求头 + 请求体** 组成：
+
+| 部分 | 字段 |
+|------|------|
+| 长度前缀 | int32，后续总字节数 |
+| RequestHeader | `apiKey`(int16)、`apiVersion`(int16)、`correlationId`(int32)、`clientId`(nullable_string) |
+| Request Body | 各 API 的 `*RequestData`(由协议编译器生成) |
+
+响应格式对称：**4 字节长度前缀 + ResponseHeader(correlationId) + ResponseBody**。`NetworkReceive`(`clients/.../network/NetworkReceive.java`)负责读取 4 字节长度前缀并组装完整请求。
+
+#### 1.4 协议版本协商
+
+客户端连接 broker 后第一次通常先发 `ApiVersionsRequest`(`ApiKeys.API_VERSIONS`，`ApiKeys.java`)查询该 broker 支持的 API 版本范围，结果缓存在 `NodeApiVersions`(`clients/.../NodeApiVersions.java`)：
+
+```java
+// NetworkClient.java:551 (doSend)
+NodeApiVersions versionInfo = apiVersions.get(nodeId);
+short version;
+if (versionInfo == null) {
+    version = builder.latestAllowedVersion();        // 未知则用最新
+} else {
+    version = versionInfo.latestUsableVersion(       // 协商出双方都支持的最高版本
+        clientRequest.apiKey(), builder.oldestAllowedVersion(),
+        builder.latestAllowedVersion());
+}
+```
+
+`UnsupportedVersionException` 会被捕获并把响应放入 `abortedSends`，避免阻塞网络(`NetworkClient.java:583`)。
+
+#### 1.5 编解码与零拷贝
+
+请求/响应序列化用 `SendBuilder`(`clients/.../protocol/SendBuilder.java`)，它支持把 `MemoryRecords` 这种"已序列化的内存块"作为引用传递，最终通过 `ByteBufferSend` 或 `MultiRecordsSend` 发出。真正的零拷贝发生在存储层 `FileRecords.writeTo(TransferableChannel)`(详见第四章)，网络层通过 `GatheringByteChannel.write(ByteBuffer[])` 实现分散/聚集 IO，减少用户态拷贝。
+
+### 二、服务端网络层 Reactor 模型
+
+#### 2.1 整体架构
+
+```mermaid
+flowchart LR
+    subgraph Net["网络层"]
+        AC["Acceptor (1 线程/监听器)<br/>OP_ACCEPT"]
+        P1["Processor #0<br/>NIO Selector"]
+        P2["Processor #1"]
+        Pn["Processor #N-1<br/>(num.network.threads)"]
+    end
+    subgraph Queue["请求/响应队列"]
+        RQ["requestQueue<br/>ArrayBlockingQueue<br/>(queued.max.requests)"]
+        CQ["callbackQueue"]
+        RSP1["Processor #0 responseQueue"]
+        RSP2["Processor #1 responseQueue"]
+        RSPn["Processor #N-1 responseQueue"]
+    end
+    subgraph IO["IO 线程池"]
+        H1["KafkaRequestHandler #0"]
+        H2["KafkaRequestHandler #1"]
+        Hm["KafkaRequestHandler #M-1<br/>(num.io.threads)"]
+    end
+    subgraph Biz["业务层"]
+        APIS["KafkaApis.handle"]
+        RM["ReplicaManager / Log"]
+        GC["GroupCoordinator"]
+    end
+
+    Client["Client 连接"] -->|"OP_ACCEPT"| AC
+    AC -->|"round-robin 分配新连接"| P1 & P2 & Pn
+    P1 -->|"parseRequestHeader<br/>sendRequest"| RQ
+    P2 --> RQ
+    Pn --> RQ
+    RQ --> H1 & H2 & Hm
+    H1 --> APIS
+    H2 --> APIS
+    Hm --> APIS
+    APIS --> RM
+    APIS --> GC
+    APIS -->|"sendResponse"| RSP1 & RSP2 & RSPn
+    H1 -.->|"异步回调"| CQ
+    CQ --> H1
+    RSP1 -->|"processNewResponses"| P1
+    RSP2 --> P2
+    RSPn --> Pn
+    P1 -->|"selector.send"| Client
+```
+
+这是经典的 **Acceptor-Processor-Handler** 三段式 Reactor：网络 IO 与业务处理解耦，通过有界队列背压。
+
+#### 2.2 SocketServer
+
+`SocketServer.scala:71` 是服务端网络层入口：
+
+```scala
+// SocketServer.scala:85
+private val maxQueuedRequests = config.queuedMaxRequests   // requestQueue 容量
+// SocketServer.scala:97
+private val memoryPool = if (config.queuedMaxBytes > 0)
+    new SimpleMemoryPool(config.queuedMaxBytes, config.socketRequestMaxBytes, false, memoryPoolSensor)
+  else MemoryPool.NONE
+// SocketServer.scala:99
+private[network] val dataPlaneAcceptors = new ConcurrentHashMap[Endpoint, DataPlaneAcceptor]()
+// SocketServer.scala:100
+val dataPlaneRequestChannel = new RequestChannel(maxQueuedRequests, time, apiVersionManager.newRequestMetrics)
+```
+
+构造时(`SocketServer.scala:146-150`)根据 `listenerType` 决定为 `CONTROLLER` 还是 `BROKER` 创建 acceptor：controller listener 与 data-plane listener 严格分离。
+
+#### 2.3 Acceptor：接收新连接
+
+`Acceptor`(`SocketServer.scala:458`)每个监听器一个线程，跑 accept 循环：
+
+```scala
+// SocketServer.scala:478
+private val nioSelector = NSelector.open()      // 独占 NIO Selector
+
+// SocketServer.scala:572
+override def run(): Unit = {
+  serverChannel.register(nioSelector, SelectionKey.OP_ACCEPT)
+  while (shouldRun.get()) {
+    acceptNewConnections()       // SocketServer.scala:623
+    closeThrottledConnections()
+  }
+}
+```
+
+`acceptNewConnections`(`SocketServer.scala:623`)用 `nioSelector.select(500)` 阻塞 500ms，对每个 `OP_ACCEPT` 就绪的 key 调 `accept(key)` 拿到 `SocketChannel`，然后**轮询(round-robin)分配**给下一个 Processor：
+
+```scala
+// SocketServer.scala:638-649
+var retriesLeft = synchronized(processors.length)
+do {
+  retriesLeft -= 1
+  processor = synchronized {
+    currentProcessorIndex = currentProcessorIndex % processors.length
+    processors(currentProcessorIndex)
+  }
+  currentProcessorIndex += 1
+} while (!assignNewConnection(socketChannel, processor, retriesLeft == 0))
+```
+
+若所有 Processor 的 `newConnections` 队列都满则阻塞，实现背压。`Acceptor` 自带 `blockedPercentMeter` 统计被阻塞的时间比例。
+
+#### 2.4 Processor：读写 IO 与协议解析
+
+`Processor`(`SocketServer.scala:797`)每个线程一个独立 NIO `KSelector`，主循环(`SocketServer.scala:889`)：
+
+```scala
+// SocketServer.scala:889
+override def run(): Unit = {
+  while (shouldRun.get()) {
+    configureNewConnections()     // 注册新连接到 selector
+    processNewResponses()         // 把响应写入 channel
+    poll()                        // selector.poll
+    processCompletedReceives()    // 处理完整请求 -> requestChannel.sendRequest
+    processCompletedSends()       // 处理已发送响应
+    processDisconnected()
+    closeExcessConnections()
+  }
+}
+```
+
+关键字段：
+
+```scala
+// SocketServer.scala:827
+private val newConnections = new ArrayBlockingQueue[SocketChannel](connectionQueueSize)
+private val inflightResponses = mutable.Map[String, RequestChannel.Response]()
+private val responseQueue = new LinkedBlockingDeque[RequestChannel.Response]()
+// SocketServer.scala:849
+private[network] val selector = createSelector(
+    ChannelBuilders.serverChannelBuilder(...))   // 根据 securityProtocol 创建 ChannelBuilder
+```
+
+**流控 mute/unmute** 是关键：当 `requestQueue` 满或配额触发时，Processor 调 `selector.mute(connectionId)`(`SocketServer.scala:1041`)暂停该 channel 的读，避免继续读取请求把队列压垮；响应发完且无配额时 `tryUnmuteChannel` 恢复读。这保证了 backpressure。
+
+`processCompletedReceives`(`SocketServer.scala:1002`)对每个完整接收：
+
+```scala
+// SocketServer.scala:1027
+req = new RequestChannel.Request(processor = id, context = context,
+    startTimeNanos = nowNanos, memoryPool, receive.payload, requestChannel.metrics, None)
+...
+requestChannel.sendRequest(req)      // 入 requestQueue
+selector.mute(connectionId)         // mute 直到响应发完，防 pipelined 请求压垮
+```
+
+`processNewResponses`(`SocketServer.scala:933`)从 `responseQueue` 拉响应，根据类型(`SendResponse`/`NoOpResponse`/`CloseConnectionResponse`/`StartThrottlingResponse`/`EndThrottlingResponse`)处理，`SendResponse` 走 `selector.send(NetworkSend)`(`SocketServer.scala:986`)。
+
+#### 2.5 RequestChannel：解耦队列
+
+`RequestChannel`(`RequestChannel.scala:343`)是网络线程与 IO 线程的解耦点：
+
+```scala
+// RequestChannel.scala:353
+private val requestQueue = new ArrayBlockingQueue[BaseRequest](queueSize)  // queued.max.requests
+private val callbackQueue = new ArrayBlockingQueue[BaseRequest](queueSize) // 异步回调队列
+```
+
+核心方法：
+
+| 方法 | 位置 | 作用 |
+|------|------|------|
+| `sendRequest(request)` | `RequestChannel.scala:379` | Processor 把请求 `put` 入 requestQueue(阻塞) |
+| `receiveRequest(timeout)` | `RequestChannel.scala:464` | IO 线程阻塞拉取；优先 poll callbackQueue |
+| `sendResponse(response)` | `RequestChannel.scala:420` | IO 线程完成后，按 `processor` 字段路由到对应 Processor 的 responseQueue |
+| `sendCallbackRequest(req)` | `RequestChannel.scala:499` | 异步回调任务入 callbackQueue，并通过 `WakeupRequest` 唤醒阻塞的 IO 线程 |
+
+`Request` 对象(`RequestChannel.scala:64`)携带：`processor`、`context`(`RequestContext` 含 header、connectionId、principal、clientAddress)、`startTimeNanos`、`buffer`、`memoryPool`，以及一组 `@volatile` 时间戳记录全链路耗时(`requestDequeueTimeNanos`/`apiLocalCompleteTimeNanos`/`responseCompleteTimeNanos`/`responseDequeueTimeNanos`)用于请求指标。
+
+#### 2.6 KafkaRequestHandler：IO 线程
+
+`KafkaRequestHandler`(`KafkaRequestHandler.scala:88`)的 `run()`(`KafkaRequestHandler.scala:105`)：
+
+```scala
+// KafkaRequestHandler.scala:114
+val req = requestChannel.receiveRequest(300)    // 阻塞拉取 300ms
+req match {
+  case ShutdownRequest => completeShutdown(); return
+  case callback: CallbackRequest =>            // 异步回调任务
+    threadCurrentRequest.set(callback.originalRequest)
+    callback.fun(requestLocal)                 // 在 IO 线程执行回调
+  case request: RequestChannel.Request =>
+    threadCurrentRequest.set(request)
+    apis.handle(request, requestLocal)         // 进入 KafkaApis
+  case null => // continue
+}
+```
+
+每个线程持有 `RequestLocal`(`KafkaRequestHandler.scala:102`)，提供线程本地的 `ByteBuffer` 缓存，避免请求处理中的反复分配。`RequestHandlerPool`(`KafkaRequestHandler.scala:223`)管理线程池，支持运行时 `resizeThreadPool`(动态修改 `num.io.threads`)，分别有 `data-plane` 与 `controller` 两套池(由 `nodeName` 区分，`KafkaRequestHandler.scala:239`)。
+
+#### 2.7 KafkaApis 分发
+
+`KafkaApis.handle`(`KafkaApis.scala:152`)是所有请求的总入口，按 `apiKey` 模式匹配路由：
+
+```scala
+// KafkaApis.scala:169
+request.header.apiKey match {
+  case ApiKeys.PRODUCE => handleProduceRequest(request, requestLocal)
+  case ApiKeys.FETCH => handleFetchRequest(request)
+  case ApiKeys.OFFSET_COMMIT => handleOffsetCommitRequest(request, requestLocal).exceptionally(handleError)
+  case ApiKeys.JOIN_GROUP => handleJoinGroupRequest(request, requestLocal).exceptionally(handleError)
+  case ApiKeys.HEARTBEAT => handleHeartbeatRequest(request).exceptionally(handleError)
+  case ApiKeys.SYNC_GROUP => handleSyncGroupRequest(request, requestLocal).exceptionally(handleError)
+  case ApiKeys.CONSUMER_GROUP_HEARTBEAT => handleConsumerGroupHeartbeat(request).exceptionally(handleError)
+  ...
+  case ApiKeys.CREATE_TOPICS => forwardToController(request)    // 转发到 controller
+  case ApiKeys.DELETE_TOPICS => forwardToController(request)
+  ...
+  case _ => throw new IllegalStateException(s"No handler for request api key ${request.header.apiKey}")
+}
+```
+
+末尾(`KafkaApis.scala:255-263`)的 `finally` 块调 `replicaManager.tryCompleteActions()` 唤醒延迟操作，并记录 `apiLocalCompleteTimeNanos`。`forwardToController` 把请求通过 `NodeToControllerRequestThread` 转发给 active controller，是数据平面到控制平面的桥。
+
+#### 2.8 Reactor 全链路时序
+
+```mermaid
+sequenceDiagram
+    participant Cli as Client
+    participant Ac as Acceptor
+    participant Pr as Processor #i
+    participant RQ as RequestChannel.requestQueue
+    participant IO as KafkaRequestHandler
+    participant Apis as KafkaApis
+    participant Rsp as Processor.responseQueue
+
+    Cli->>Ac: TCP connect (SYN)
+    Ac->>Ac: accept() 拿 SocketChannel
+    Ac->>Pr: assignNewConnection (round-robin)
+    Pr->>Pr: configureNewConnections 注册到 KSelector
+    Pr->>Pr: poll() OP_READ
+    Cli->>Pr: 发送请求字节
+    Pr->>Pr: processCompletedReceives 解析 RequestHeader + body
+    Pr->>RQ: sendRequest(req) (put 阻塞)
+    Pr->>Pr: selector.mute(connectionId) 防止 pipelined 压垮
+    RQ->>IO: receiveRequest(300) (poll 阻塞拉取)
+    IO->>Apis: apis.handle(request, requestLocal)
+    Apis->>Apis: 路由到 handleXxxRequest
+    Apis-->>IO: 完成 (CompletableFuture)
+    IO->>Rsp: requestChannel.sendResponse(...) 路由到 Processor #i
+    Rsp->>Pr: processor.enqueueResponse (responseQueue)
+    Note over Pr: 下一次 run 循环
+    Pr->>Pr: processNewResponses -> selector.send(NetworkSend)
+    Pr->>Cli: 写响应字节
+    Pr->>Pr: processCompletedSends
+    Pr->>Pr: tryUnmuteChannel 恢复读
+```
+
+### 三、客户端网络层
+
+#### 3.1 NetworkClient
+
+`NetworkClient`(`clients/.../NetworkClient.java`)是客户端的"网络大脑"，管理连接、发送、接收、元数据更新：
+
+```java
+// NetworkClient.java:541
+public void send(ClientRequest request, long now) {
+    doSend(request, false, now);
+}
+
+// NetworkClient.java:551
+private void doSend(ClientRequest clientRequest, boolean isInternalRequest, long now) {
+    ensureActive();
+    String nodeId = clientRequest.destination();
+    ...
+    AbstractRequest.Builder<?> builder = clientRequest.requestBuilder();
+    NodeApiVersions versionInfo = apiVersions.get(nodeId);
+    short version = (versionInfo == null) ? builder.latestAllowedVersion()
+        : versionInfo.latestUsableVersion(clientRequest.apiKey(), builder.oldestAllowedVersion(),
+                                          builder.latestAllowedVersion());
+    doSend(clientRequest, isInternalRequest, now, builder.build(version));
+}
+
+// NetworkClient.java:601
+private void doSend(ClientRequest clientRequest, boolean isInternalRequest, long now, AbstractRequest request) {
+    String destination = clientRequest.destination();
+    RequestHeader header = clientRequest.makeHeader(request.version());
+    Send send = request.toSend(header);
+    InFlightRequest inFlightRequest = new InFlightRequest(clientRequest, header, isInternalRequest, request, send, now);
+    this.inFlightRequests.add(inFlightRequest);         // 加入飞行队列
+    selector.send(new NetworkSend(clientRequest.destination(), send));  // 真正发出
+}
+```
+
+`poll`(`NetworkClient.java:630`)把"select IO + 元数据更新 + 响应处理"合一：
+
+```java
+// NetworkClient.java:630
+public List<ClientResponse> poll(long timeout, long now) {
+    ensureActive();
+    if (!abortedSends.isEmpty()) { ... handleAbortedSends ... }
+    long metadataTimeout = metadataUpdater.maybeUpdate(now);     // 元数据按需更新
+    long telemetryTimeout = telemetrySender != null ? telemetrySender.maybeUpdate(now) : Integer.MAX_VALUE;
+    this.selector.poll(Utils.min(timeout, metadataTimeout, telemetryTimeout, defaultRequestTimeoutMs));
+    long updatedNow = this.time.milliseconds();
+    List<ClientResponse> responses = new ArrayList<>();
+    handleCompletedSends(responses, updatedNow);        // 请求完成发送 -> 触发回调
+    handleCompletedReceives(responses, updatedNow);    // 收到响应 -> 解析 + 回调
+    handleDisconnections(responses, updatedNow);        // 连接断开 -> 失败所有飞行中请求
+    handleConnections();                                // 新连接建立
+    handleInitiateApiVersionRequests(updatedNow);       // 新连接发起 ApiVersionsRequest
+    handleTimedOutConnections(responses, updatedNow);
+    handleTimedOutRequests(responses, updatedNow);
+    handleRebootstrap(responses, updatedNow);
+    completeResponses(responses);                       // 调用 callback
+    return responses;
+}
+```
+
+`leastLoadedNode`(`NetworkClient.java:759`)挑选"最空闲"节点(飞行请求最少、连接 ready)用于发元数据请求或其它无目标请求。`initiateConnect`(`NetworkClient.java:1136`)负责真正建连。
+
+#### 3.2 Selector NIO 封装
+
+`Selector`(`clients/.../network/Selector.java`)是对 `java.nio.channels.Selector` 的封装：
+
+```java
+// Selector.java:445
+public void poll(long timeout) throws IOException {
+    ...
+    int numReadyKeys = select(timeout);    // 阻塞 select
+    if (numReadyKeys > 0 || !immediatelyConnectedKeys.isEmpty() || dataInBuffers) {
+        // 先处理缓冲中已有数据，再处理就绪 key，最后处理刚连上的 key
+        pollSelectionKeys(readyKeys, false, endSelect);
+        pollSelectionKeys(immediatelyConnectedKeys, true, endSelect);
+    }
+    maybeCloseOldestConnection(endSelect);
+}
+```
+
+`pollSelectionKeys`(`Selector.java:514`)对每个就绪 key：完成连接握手(`finishConnect`)、`attempRead`/`attempWrite`、处理断开。`mute`(`Selector.java:743`)/`unmute`(`Selector.java:755`)通过关闭/打开 channel 的读兴趣位实现流控。
+
+#### 3.3 KafkaChannel 与 TransportLayer
+
+`KafkaChannel`(`clients/.../network/KafkaChannel.java`)封装 `SocketChannel`、`TransportLayer`、`NetworkReceive`、`NetworkSend`：
+
+| TransportLayer 实现 | 场景 |
+|---------------------|------|
+| `PlaintextTransportLayer` | 明文 TCP |
+| `SslTransportLayer` | TLS |
+
+`ChannelBuilder`(`PlaintextChannelBuilder`/`SslChannelBuilder`/`SaslChannelBuilder`)根据 `security.protocol` 创建，负责握手与认证。`TransportLayer.transferFrom` 提供零拷贝文件传输接口(供 `FileRecords.writeTo` 使用)。
+
+#### 3.4 InFlightRequests
+
+`InFlightRequests`(`clients/.../InFlightRequests.java:31`)按节点维护飞行中请求的双端队列：
+
+```java
+// InFlightRequests.java:33
+private final int maxInFlightRequestsPerConnection;   // max.in.flight.requests.per.connection
+private final Map<String, Deque<NetworkClient.InFlightRequest>> requests = new HashMap<>();
+```
+
+关键方法：
+- `add`(`InFlightRequests.java:45`)：新请求 `addFirst` 入队
+- `completeNext`(`InFlightRequests.java:65`)：完成最老请求(响应按 FIFO 顺序到达)
+- `canSendMore`(`InFlightRequests.java:96`)：判断能否继续发(队列未超上限且上次 send 已完成)
+- `nodesWithTimedOutRequests`(`InFlightRequests.java:171`)：超时检查
+
+`max.in.flight.requests.per.connection=5`(默认)是**幂等 producer 保障顺序**的关键：必须 <= 5 才能保证幂等性(否则重试可能打乱顺序)。
+
+#### 3.5 流控 mute/unmute
+
+| 场景 | 触发 | 位置 |
+|------|------|------|
+| 服务端请求队列满 | `requestQueue.put` 阻塞前 mute | `Processor.processCompletedReceives` |
+| 服务端配额触发 | `QuotaType` 超限 | `Processor.processNewResponses`(StartThrottling/EndThrottling) |
+| 响应发完 | `processCompletedSends` 后 unmute | `SocketServer.scala:1077` |
+| 客户端飞行请求满 | `canSendMore == false` | `NetworkClient.doSend` 前检查 |
+
+### 四、数据平面 vs 控制平面
+
+#### 4.1 监听器分离
+
+KRaft 模式下监听器严格分离：
+
+| 配置 | 用途 |
+|------|------|
+| `listeners` / `advertised.listeners` | data-plane，处理客户端 + broker 间数据请求 |
+| `controller.listener.names` | controller-plane，仅 quorum 间 Raft 通信 + broker->controller 转发 |
+| `inter.broker.listener.name` | broker 间数据请求(如 follower fetch) |
+
+`SocketServer` 构造时(`SocketServer.scala:146-150`)根据 `listenerType` 决定创建哪类 acceptor，`ControllerServer` 与 `BrokerServer` 各自持有独立的 `SocketServer` 与 `RequestChannel`，IO 线程池也完全独立(`KafkaRequestHandlerPool` 的 `nodeName="controller"` 或 `"broker"`，见 `KafkaRequestHandler.scala:239`)。这避免了 controller 的高优先级请求被数据流量挤占。
+
+#### 4.2 forwarding 转发
+
+broker 收到本应由 controller 处理的请求(如 `CREATE_TOPICS`、`DELETE_TOPICS`、`CREATE_ACLS`、`ALTER_CLIENT_QUOTAS` 等，见 `KafkaApis.scala:185-220` 的 `forwardToController`)，通过 `NodeToControllerRequestThread` 把请求用 **EnvelopeRequest** 封装转发给 active controller。controller 端解封处理后再用 EnvelopeResponse 回复。这要求 broker 知道 active controller 的位置(从 `metadataCache` 拿)。
+
+#### 4.3 Quorum 通信
+
+KRaft quorum 内部 Raft 通信(`VoteRequest`/`BeginQuorumEpoch`/`EndQuorumEpoch`/`Fetch`/`Append`)走 controller listener，由 `RaftManager` / `KafkaRaftClient`(`raft` 模块)驱动，复用 `clients` 的 `NetworkClient` 但用独立的 `QuorumRequestManager`。这部分与第二章 KafkaApis 中 `forwardToController(DESCRIBE_QUORUM)`、`ADD_RAFT_VOTER`、`REMOVE_RAFT_VOTER` 等是控制平面 API。
+
+### 五、限流与配额
+
+#### 5.1 ConnectionQuotas
+
+`ConnectionQuotas`(`core/.../network/ConnectionQuotas.scala`)管理多维度连接配额：
+- 每 IP 的连接数上限(`max.connections.per.ip`)
+- 每 listener 的连接数上限
+- 全局连接数上限(`max.connections`)
+- broker / controller 分别的连接配额(`max.connections.overridden`)
+
+`Acceptor.accept` 拿到新连接后调 `connectionQuotas.incrant(listenerName, address, now)`，超限则关闭连接或阻塞(配合 `DelayedCloseSocket` 限速队列，`SocketServer.scala:502`)。
+
+#### 5.2 Throttle 机制
+
+配额触发时服务端走"延迟响应"节流而非直接拒绝：
+
+| 响应类型 | 含义 | 处理 |
+|----------|------|------|
+| `StartThrottlingResponse` | 通知 Processor 该 channel 开始节流，mute 读 | `SocketServer.scala:956` |
+| `EndThrottlingResponse` | 节流结束，可 unmute | `SocketServer.scala:958` |
+| 普通 `SendResponse` | 携带 `throttleTimeMs` 字段，告知客户端自我节流 | 客户端 `InFlightRequests.incrementThrottleTime` |
+
+客户端收到 `throttleTimeMs > 0` 后(`InFlightRequests.java:182` 的 `incrementThrottleTime`)会给该节点所有飞行请求累加节流时间，避免在节流窗口内继续发请求；`hasExpiredRequest`(`InFlightRequests.java:155`)计算超时时排除节流时间，确保节流期间不误判超时。
+
+### 六、关键源码文件清单
+
+| 类别 | 文件 |
+|------|------|
+| 协议枚举 | `clients/src/main/java/org/apache/kafka/common/protocol/ApiKeys.java` |
+| 序列化 | `clients/src/main/java/org/apache/kafka/common/protocol/Message.java`、`ApiMessage.java`、`ByteBufferAccessor.java`、`Readable.java`、`Writable.java`、`types/RawTaggedField.java`、`types/Struct.java`、`SendBuilder.java` |
+| 编解码 | `clients/src/main/java/org/apache/kafka/common/network/NetworkSend.java`、`NetworkReceive.java`、`Send.java`、`ByteBufferSend.java`、`TransferableChannel.java` |
+| 版本协商 | `clients/src/main/java/org/apache/kafka/common/requests/ApiVersionsRequest.java`、`ApiVersionsResponse.java`、`clients/src/main/java/org/apache/kafka/clients/NodeApiVersions.java` |
+| 压缩 | `clients/src/main/java/org/apache/kafka/common/compress/Compression.java`、`record/internal/CompressionType.java`、`utils/BufferSupplier.java` |
+| 服务端网络 | `core/src/main/scala/kafka/network/SocketServer.scala`、`RequestChannel.scala`、`ConnectionQuotas.scala` |
+| IO 线程 | `core/src/main/scala/kafka/server/KafkaRequestHandler.scala` |
+| 业务分发 | `core/src/main/scala/kafka/server/KafkaApis.scala` |
+| 客户端网络 | `clients/src/main/java/org/apache/kafka/clients/NetworkClient.java`、`InFlightRequests.java`、`ClientRequest.java`、`ClientResponse.java` |
+| NIO 封装 | `clients/src/main/java/org/apache/kafka/common/network/Selector.java`、`KafkaChannel.java`、`TransportLayer.java`、`PlaintextTransportLayer.java`、`SslTransportLayer.java` |
+| ChannelBuilder | `clients/src/main/java/org/apache/kafka/common/network/ChannelBuilders.java`、`PlaintextChannelBuilder.java`、`SslChannelBuilder.java`、`SaslChannelBuilder.java` |
+| 控制平面 | `raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java`、`metadata/src/main/java/org/apache/kafka/metadata/...`、`server/src/main/java/org/apache/kafka/server/NodeToControllerRequestThread.java` |
 
 ---
 
