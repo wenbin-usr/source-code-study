@@ -1200,6 +1200,469 @@ nettyRemotingServer.init();
 
 所有任务通过 `SessionHolder.distributedLockAndExecute(name, task)` 获取分布式锁后执行，避免集群内重复处理。
 
+> **定时任务异常处理**：每个任务都包裹在 `distributedLockAndExecute` 中，获取分布式锁失败时会跳过本次执行（而非阻塞），保证集群内同一时刻只有一个节点处理。所有周期参数在类加载时通过 `CONFIG.getLong()` 一次性读取并定义为 `static final`，运行期修改配置不会生效（需重启）。
+
+### 9.7 配置加载机制（ConfigurationFactory）
+
+Server 启动时，几乎所有组件（存储模式、线程池大小、Netty 端口、注册中心地址等）都依赖配置中心。配置加载是整个启动流程的"第 0 步"。
+
+#### 9.7.1 双配置文件体系
+
+Seata 采用 **registry.conf + file.conf**（或远程配置中心）双文件设计：
+
+| 文件 | 作用 | 默认名 | 加载时机 |
+|------|------|--------|----------|
+| `registry.conf` | 引导配置，决定 config.type / registry.type | `registry.conf` | ConfigurationFactory 类加载时 |
+| `file.conf` | 核心业务配置（store.* / service.* / transport.*） | `file.conf` | 当 `config.type=file` 时加载 |
+
+多环境隔离：通过 `-e`（`seataEnv`）参数或 `SEATA_ENV` 环境变量，文件名变为 `registry-{env}.conf`。
+
+#### 9.7.2 ConfigurationFactory 静态初始化
+
+`config/seata-config-core/src/main/java/org/apache/seata/config/ConfigurationFactory.java` 在类加载时执行三步：
+
+```java
+static {
+    initOriginConfiguration();   // 1. 创建 registry.conf 的 FileConfiguration
+    load();                      // 2. SPI 加载 ExtConfigurationProvider（Spring 扩展点）
+    maybeNeedOriginFileInstance();// 3. 若 config.type=file，再创建 file.conf 的 FileConfiguration
+}
+```
+
+1. **`initOriginConfiguration()`**（行 90-105）：
+   - 依次从 `-Dseata.config.name` 系统属性、`SEATA_CONFIG_NAME` 环境变量读取配置文件名，默认 `registry`
+   - 从 `seataEnv` / `SEATA_ENV` 读取环境标识，拼接为 `registry-{env}`
+   - 创建 `ORIGIN_FILE_INSTANCE_REGISTRY = new FileConfiguration(seataConfigName, false)`
+
+2. **`load()`**（行 67-88）：
+   - 通过 `EnhancedServiceLoader.load(ExtConfigurationProvider.class)` 加载扩展配置提供者
+   - SpringBoot 环境下 `seata-spring-boot-starter` 会注册 `ExtConfigurationProvider`，将 Spring `Environment` 中的配置桥接进来，**优先级高于 file.conf**
+   - 最终 `CURRENT_FILE_INSTANCE` = extConfiguration（若存在）否则 ORIGIN_FILE_INSTANCE_REGISTRY
+
+3. **`maybeNeedOriginFileInstance()`**（行 132-140）：
+   - 读取 `config.type`，若为 `File` 则读取 `config.file.name`（默认 `file.conf`）
+   - 创建 `ORIGIN_FILE_INSTANCE = new FileConfiguration(name)` 供后续 `getInstance()` 使用
+
+#### 9.7.3 配置中心 SPI 加载（buildConfiguration）
+
+`getInstance()`（行 121）→ `buildConfiguration()`（行 161-185）流程：
+
+```mermaid
+flowchart TD
+    A[getInstance] --> B[getConfigType: 读取 config.type]
+    B --> C{ExtConfigurationProvider 存在?}
+    C -->|是| D[使用 Spring 桥接配置]
+    C -->|否| E[getNonSpringConfiguration: SPI 加载配置中心]
+    E --> F{config.type}
+    F -->|nacos| G[NacosConfiguration]
+    F -->|apollo| H[ApolloConfiguration]
+    F -->|zk| I[ZooKeeperConfiguration]
+    F -->|consul| J[ConsulConfiguration]
+    F -->|etcd3| K[Etcd3Configuration]
+    F -->|file| L[FileConfiguration<br/>ORIGIN_FILE_INSTANCE]
+    D --> M[ConfigurationCache.proxy 包装]
+    G --> M
+    H --> M
+    I --> M
+    J --> M
+    K --> M
+    L --> M
+    M --> N[最终 Configuration 实例]
+```
+
+关键点：
+- **`ConfigType` 枚举**：`File / ZK / Nacos / Apollo / Consul / Etcd3 / SpringCloudConfig / Custom`
+- **`ConfigurationProvider` SPI**：每个配置中心实现 `ConfigurationProvider` 接口，通过 `@LoadLevel` 注解注册，`EnhancedServiceLoader.load(ConfigurationProvider.class, configTypeName)` 按名加载
+- **ConfigurationCache 代理**（`config/seata-config-core/.../ConfigurationCache.java`）：用 JDK 动态代理包装原始 Configuration，对所有 `get*` 方法结果用 `ConcurrentHashMap` 缓存，避免重复远程查询；同时注册为 `ConfigurationChangeListener`，配置变更时自动刷新缓存
+
+#### 9.7.4 Nacos 配置中心实现示例
+
+`config/seata-config-nacos/src/main/java/org/apache/seata/config/nacos/NacosConfiguration.java`：
+
+- **初始化**：从 `registry.conf` 的 `config.nacos.*` 读取 `serverAddr` / `namespace` / `group` / `dataId`，通过 `NacosFactory.createConfigService()` 创建 `ConfigService`
+- **getConfig**：调用 `configService.getConfig(dataId, group, timeoutMs)`，超时默认 5000ms
+- **配置监听**：注册 `AbstractSharedListener`，Nacos 配置变更时触发 `ConfigurationChangeEvent`，通知所有监听器（包括 ConfigurationCache）
+
+```java
+// 简化的 NacosConfiguration 核心逻辑
+@Override
+public String getConfig(String dataId, String defaultValue, long timeoutMills) {
+    String config = configService.getConfig(dataId, group, timeoutMills);
+    return StringUtils.isBlank(config) ? defaultValue : config;
+}
+
+@Override
+public boolean putConfig(String dataId, String content, long timeoutMills) {
+    return configService.publishConfig(dataId, group, content);
+}
+```
+
+#### 9.7.5 配置优先级体系
+
+从高到低：
+
+| 优先级 | 来源 | 示例 |
+|--------|------|------|
+| 1 | JVM 系统属性 `-D` | `-Dseata.config.name=file` |
+| 2 | 命令行启动参数 | `--storeMode db`（经 `ParameterParser` → `StoreConfig.setStartupParameter`） |
+| 3 | 容器环境变量 | `SEATA_ENV` / `STORE_MODE`（`ContainerHelper` 读取） |
+| 4 | SpringBoot `application.yml` | 通过 `ExtConfigurationProvider` 桥接 |
+| 5 | 远程配置中心 | Nacos / Apollo 中的 `store.mode` 等 |
+| 6 | 本地 `file.conf` | `ORIGIN_FILE_INSTANCE` |
+| 7 | 代码默认值 | `DefaultValues.SERVER_DEFAULT_STORE_MODE = "file"` |
+
+> **命令行参数覆盖原理**：`ParameterParser.init()` 调用 `StoreConfig.setStartupParameter(storeMode, sessionMode, lockMode)`，将命令行值赋给 `StoreConfig` 的静态字段。`getStoreMode()` 优先返回该静态字段（行 96-109），从而覆盖配置中心值。
+
+#### 9.7.6 配置变更监听
+
+```mermaid
+sequenceDiagram
+    participant NC as NacosConfiguration
+    participant Cache as ConfigurationCache
+    participant Listener as ConfigurationChangeListener
+    participant SC as StoreConfig/其他组件
+
+    NC->>NC: Nacos listener 收到变更
+    NC->>Cache: fireEvent(ConfigurationChangeEvent)
+    Cache->>Cache: 清除对应 dataId 缓存
+    Cache->>Listener: onProcessEvent(event)
+    Listener->>SC: 组件响应变更
+```
+
+> 注意：`DefaultCoordinator` 中的定时任务周期是 `static final`，在类加载时读取一次，**运行期修改配置中心的重试周期不会生效**。但 `store.mode` 等部分配置通过 `ConfigurationCache` 动态读取，可实时生效（需组件主动支持）。
+
+### 9.8 数据源与存储加载详解
+
+#### 9.8.1 StoreConfig 配置读取
+
+`server/src/main/java/org/apache/seata/server/store/StoreConfig.java`：
+
+```java
+private static StoreMode getStoreMode() {
+    if (null != storeMode) return storeMode;              // 1. 命令行参数最高优先级
+    String storeModeEnv = ContainerHelper.getStoreMode(); // 2. 容器环境变量
+    if (StringUtils.isNotBlank(storeModeEnv)) return StoreMode.get(storeModeEnv);
+    String storeModeConfig = CONFIGURATION.getConfig(     // 3. 配置中心/file.conf
+            ConfigurationKeys.STORE_MODE, SERVER_DEFAULT_STORE_MODE); // 默认 file
+    return StoreMode.get(storeModeConfig);
+}
+```
+
+`getSessionMode()` / `getLockMode()` 同理，且若未单独配置 `store.session.mode` / `store.lock.mode`，则回退到 `store.mode`（兼容旧配置）。
+
+#### 9.8.2 SessionHolder.init 四种模式加载
+
+`server/src/main/java/org/apache/seata/server/session/SessionHolder.java` 行 100-159：
+
+```mermaid
+flowchart TD
+    S[SessionHolder.init] --> T{SessionMode}
+    T -->|DB| DB[EnhancedServiceLoader.load SessionManager, db]
+    DB --> DB2[reload: 从 global_table/branch_table 恢复会话]
+    DB2 --> DB3[EnhancedServiceLoader.load VGroupMappingStoreManager, db]
+    T -->|FILE| FV[读取 store.file.dir]
+    FV --> F[EnhancedServiceLoader.load SessionManager, file, name+path]
+    F --> F2[reload: 从 data dir 恢复会话]
+    T -->|REDIS| R[EnhancedServiceLoader.load SessionManager, redis]
+    R --> R2[reload: 从 Redis 恢复会话]
+    T -->|RAFT| RV[读取 server.raft.group]
+    RV --> RA[EnhancedServiceLoader.load SessionManager, raft]
+    RA --> RS[RaftServerManager.init + start]
+```
+
+核心字段：
+- `ROOT_SESSION_MANAGER`：根会话管理器（SPI 加载）
+- `SESSION_MANAGER_MAP`：多 group SessionManager 映射（Raft 模式用）
+- `ROOT_VGROUP_MAPPING_MANAGER`：vgroup 映射存储管理器
+- `DISTRIBUTED_LOCKER`：分布式锁（`DistributedLockerFactory` 按 mode 加载）
+
+#### 9.8.3 DB 模式数据源初始化
+
+DB 模式下，`SessionHolder.init` 加载 `DataBaseSessionManager`（`server/.../storage/db/session/DataBaseSessionManager.java`），其底层 `DataBaseTransactionStoreManager` 构造时初始化数据源：
+
+```java
+// DataBaseTransactionStoreManager 构造（简化）
+private DataBaseTransactionStoreManager() {
+    String datasourceType = CONFIG.getConfig(
+            ConfigurationKeys.STORE_DB_DATASOURCE_TYPE);  // store.db.datasource = druid/hikari
+    // SPI 加载 DataSourceProvider
+    DataSource logStoreDataSource = EnhancedServiceLoader
+            .load(DataSourceProvider.class, datasourceType).provide();
+    logStore = new LogStoreDataBaseDAO(logStoreDataSource);
+}
+```
+
+**DataSourceProvider SPI 实现**（`server/.../storage/db/store/DataSourceProvider.java`）：
+- `DruidDataSourceProvider`：创建 `DruidDataSource`，读取 `store.db.url/user/password/driverClassName/minConn/maxConn` 等配置
+- `HikariDataSourceProvider`：创建 `HikariDataSource`
+
+**关键配置项**（`store.db.*`）：
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `store.db.datasource` | 连接池类型 | druid |
+| `store.db.driverClassName` | JDBC 驱动 | com.mysql.cj.jdbc.Driver |
+| `store.db.url` | 数据库连接 URL | - |
+| `store.db.user` / `store.db.password` | 账号密码 | - |
+| `store.db.minConn` / `store.db.maxConn` | 连接数 | 5 / 30 |
+| `store.db.globalTable` / `store.db.branchTable` / `store.db.lockTable` / `store.db.distributedLockTable` | 表名 | global_table 等 |
+| `store.db.queryLimit` | 查询上限 | 1000 |
+
+> **表结构需手动初始化**：Seata 不会自动建表。SQL 脚本位于 `script/server/db/mysql.sql` / `postgresql.sql` / `oracle.sql`，包含 `global_table` / `branch_table` / `lock_table` / `distributed_lock` 四张表。`vgroup_table` 在 2.x 新增，用于 vgroup 动态映射。
+
+#### 9.8.4 Redis 模式数据源初始化
+
+`RedisSessionManager` 底层使用 `RedisTransactionStoreManager`，通过 `JedisPooledFactory`（`server/.../storage/redis/JedisPooledFactory.java`）创建 Jedis 连接池：
+
+```java
+// JedisPooledFactory 简化
+public static JedisPooled getJedisPooledInstance() {
+    // 读取 store.redis.host/port/password/db/minIdle/maxActive
+    JedisPoolConfig poolConfig = new JedisPoolConfig();
+    jedisPool = new JedisPooled(poolConfig, host, port, timeout, password, database);
+    return jedisPool;
+}
+```
+
+支持两种存储类型：`store.redis.type=pipeline`（默认，普通管道）或 `lua`（Lua 脚本原子操作，`RedisLuaTransactionStoreManager`）。
+
+#### 9.8.5 File 模式初始化
+
+File 模式读取 `store.file.dir`（默认 `sessionStore`），按端口分目录（`{dir}/{port}`），通过 `FileTransactionStoreManager` 基于 NIO 写入磁盘文件。`reload()` 从文件反序列化恢复所有 `GlobalSession` 到内存。
+
+#### 9.8.6 Raft 模式初始化
+
+Raft 模式下，`SessionHolder.init` 额外调用 `RaftServerManager.init()` + `RaftServerManager.start()`，基于 SOFAJRaft 启动 Raft 节点，所有会话变更通过 Raft 协议同步。`RaftSessionManager` 继承 `FileSessionManager`，本地仍保留文件副本。
+
+#### 9.8.7 LockerManagerFactory 锁管理器加载
+
+`server/src/main/java/org/apache/seata/server/lock/LockerManagerFactory.java`：
+
+```java
+public static void init(LockMode lockMode) {
+    if (LOCK_MANAGER == null) {
+        synchronized (LockerManagerFactory.class) {
+            if (LOCK_MANAGER == null) {
+                if (null == lockMode) lockMode = StoreConfig.getLockMode();
+                LOCK_MANAGER = EnhancedServiceLoader.load(
+                        LockManager.class, lockMode.getName());
+            }
+        }
+    }
+}
+```
+
+| LockMode | LockManager 实现 | 说明 |
+|----------|-----------------|------|
+| file | `FileLockManager` | 内存 + 文件 |
+| db | `DataBaseLockManager` | 操作 `lock_table` 表 |
+| redis | `RedisLockManager` | Redis SETNX |
+| raft | `RaftLockManager` | Raft 复制 |
+
+### 9.9 注册中心注册流程
+
+#### 9.9.1 注册入口
+
+Server 端注册到注册中心的入口在 **`NettyServerBootstrap.start()`**（`core/src/main/java/org/apache/seata/core/rpc/netty/NettyServerBootstrap.java` 行 164-211），而非 `Server.start()`：
+
+```java
+public void start() {
+    // ... Netty bootstrap 配置 ...
+    this.serverBootstrap.bind(port).sync();
+    LOGGER.info("Server started, service listen port: {}", getListenPort());
+    Instance instance = Instance.getInstance();
+    if (instance.getTransaction() == null) {
+        Instance.getInstance().setTransaction(
+                new Node.Endpoint(XID.getIpAddress(), XID.getPort(), "netty"));
+    }
+    // ★ 关键：注册到所有配置的注册中心
+    for (RegistryService<?> registryService : MultiRegistryFactory.getInstances()) {
+        registryService.register(Instance.getInstance());
+    }
+    initialized.set(true);
+}
+```
+
+> **2.x 新增 `Instance` 元数据**：相比 1.x 仅注册 `InetSocketAddress`，2.x 的 `Instance`（`common/.../metadata/Instance.java`）携带更丰富信息：`namespace` / `clusterName` / `unit` / `version` / `transaction Endpoint` / `control Endpoint` / `metadata(vGroup 映射)`。
+
+#### 9.9.2 MultiRegistryFactory 多注册中心
+
+`discovery/seata-discovery-core/.../registry/MultiRegistryFactory.java`：
+
+```java
+private static List<RegistryService> buildRegistryServices() {
+    String registryTypeNamesStr = ConfigurationFactory.CURRENT_FILE_INSTANCE.getConfig(
+            ConfigurationKeys.FILE_ROOT_REGISTRY + "." + ConfigurationKeys.FILE_ROOT_TYPE);
+    // 支持逗号分隔的多注册中心类型
+    Set<String> registryTypeNames = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+    registryTypeNames.addAll(Arrays.asList(registryTypeNamesStr.split(Constants.REGISTRY_TYPE_SPLIT_CHAR)));
+    List<RegistryService> registryServices = new ArrayList<>();
+    for (String name : registryTypeNames) {
+        RegistryService service = EnhancedServiceLoader.load(RegistryProvider.class, name).provide();
+        registryServices.add(service);
+    }
+    return registryServices;
+}
+```
+
+> 配置 `registry.type=nacos,etcd3` 即可同时注册到 Nacos 和 etcd3，适用于注册中心迁移场景。
+
+#### 9.9.3 各注册中心 register 实现
+
+| 注册中心 | 注册方式 | 心跳/存活机制 | 注销方式 |
+|----------|----------|---------------|----------|
+| **File** | 不注册，仅从 `service.{cluster}.grouplist` 读取地址 | 无 | 无 |
+| **Nacos** | `namingService.registerInstance(serviceName, group, ip, port, cluster)` | Nacos 客户端自动心跳（默认 5s） | `deregisterInstance` |
+| **Eureka** | `applicationInfoManager.setInstanceStatus(UP)` | 客户端每 30s 心跳 | `setInstanceStatus(DOWN)` |
+| **Consul** | `agentClient.agentServiceRegister(NewService)` | TCP/HTTP 健康检查（10s） | `agentServiceDeregister` |
+| **Etcd3** | `kvClient.put(key, value, PutOption.withLeaseId(leaseId))` | `EtcdLifeKeeper` 定期续约 lease（TTL 10s） | lease 过期自动删除 |
+| **ZooKeeper** | `createEphemeral(path, true)` 创建临时节点 | session 心跳，session 失效节点自动删除 | 删除临时节点 |
+| **Redis** | `setex(key, TTL=5s, value)` + `publish` 通知 | 定时线程每 2s 刷新 TTL | key 自动过期 |
+
+#### 9.9.4 NamingServer 模式（SeataInstanceStrategy）
+
+2.6.0 新增 **NamingServer** 注册模式，通过 `SeataInstanceStrategy` 策略类实现，在 `Server.start()` 中调用：
+
+```java
+// Server.java 行 109
+Optional.ofNullable(seataInstanceStrategy).ifPresent(SeataInstanceStrategy::init);
+```
+
+`AbstractSeataInstanceStrategy.init()`（`server/.../instance/AbstractSeataInstanceStrategy.java` 行 67-93）：
+
+```java
+public void init() {
+    String types = registryProperties.getType();
+    if (types == null || !Arrays.asList(types.split(",")).contains(NAMING_SERVER)) {
+        return;  // 未启用 namingserver 则跳过
+    }
+    Instance instance = serverInstanceInit();  // 加载元数据
+    instance.setVersion(Version.getCurrent());
+    if (init.compareAndSet(false, true)) {
+        instance.addMetadata("vGroup", vGroupMappingStoreManager.loadVGroups());
+        // 定时心跳通知 vgroup 映射（默认周期 registry.namingserver.heartbeatPeriod）
+        EXECUTOR_SERVICE.scheduleAtFixedRate(() -> {
+            if (instance.getTerm() > 0) {
+                SessionHolder.getRootVGroupMappingManager().notifyMapping();
+            }
+        }, heartbeatPeriod, heartbeatPeriod, TimeUnit.MILLISECONDS);
+    }
+}
+```
+
+`GeneralInstanceStrategy.serverInstanceInit()` 加载 `Instance` 元数据：`namespace` / `clusterName` / `cluster-type` / `unit`(随机UUID) / `term`(时间戳) / `control Endpoint`(http 端口) / `metadata`（`meta.*` 前缀配置 + vGroup 映射）。
+
+> **与普通注册中心的区别**：NamingServer 模式下，TC 不仅注册自身地址，还周期性推送 vgroup→cluster 映射关系，客户端通过长轮询感知变化（详见第十一章）。
+
+#### 9.9.5 客户端从注册中心拉取 TC 地址
+
+客户端（TM/RM）通过 `RegistryFactory.getInstance().lookup(transactionServiceGroup)` 获取 TC 地址列表：
+
+```java
+// NettyClientChannelManager 简化
+private List<String> getAvailServerList(String transactionServiceGroup) throws Exception {
+    List<InetSocketAddress> list = RegistryFactory.getInstance()
+            .lookup(transactionServiceGroup);
+    return list.stream().map(NetUtil::toStringAddress).collect(Collectors.toList());
+}
+```
+
+`lookup()` 内部先 `getServiceGroup(key)` 读取 `service.vgroupMapping.{vgroup}` 得到 clusterName，再按 cluster 查询实例列表。各注册中心通过 subscribe/watch 机制感知 TC 上下线，动态刷新本地缓存。
+
+### 9.10 Netty 服务器初始化
+
+#### 9.10.1 NettyRemotingServer.init
+
+`core/src/main/java/org/apache/seata/core/rpc/netty/NettyRemotingServer.java` 行 58-65：
+
+```java
+@Override
+public void init() {
+    registerProcessor();                    // 1. 注册各消息类型 Processor
+    if (initialized.compareAndSet(false, true)) {
+        super.init();                        // 2. 调用 AbstractNettyRemotingServer.init → bootstrap.start
+    }
+}
+```
+
+#### 9.10.2 Processor 注册表
+
+`registerProcessor()`（行 102-130）注册 5 类 Processor：
+
+| Processor | 处理的消息类型 | 线程池 |
+|-----------|----------------|--------|
+| `ServerOnRequestProcessor` | TYPE_BRANCH_REGISTER / BRANCH_STATUS_REPORT / GLOBAL_BEGIN / GLOBAL_COMMIT / GLOBAL_LOCK_QUERY / GLOBAL_REPORT / GLOBAL_ROLLBACK / GLOBAL_STATUS / **SEATA_MERGE** | messageExecutor（核心业务线程池） |
+| `ServerOnResponseProcessor` | TYPE_BRANCH_COMMIT_RESULT / BRANCH_ROLLBACK_RESULT | branchResultMessageExecutor（分支结果线程池） |
+| `RegRmProcessor` | TYPE_REG_RM（RM 注册） | messageExecutor |
+| `RegTmProcessor` | TYPE_REG_CLT（TM 注册） | 无（直接执行） |
+| `ServerHeartbeatProcessor` | TYPE_HEARTBEAT_MSG（心跳） | 无 |
+
+#### 9.10.3 NettyServerBootstrap.start
+
+`core/.../rpc/netty/NettyServerBootstrap.java` 行 164-211：
+
+```java
+public void start() {
+    this.serverBootstrap
+        .group(eventLoopGroupBoss, eventLoopGroupWorker)   // boss/worker 两个 EventLoopGroup
+        .channel(NettyServerConfig.SERVER_CHANNEL_CLAZZ)   // NioServerSocketChannel
+        .option(ChannelOption.SO_BACKLOG, soBackLogSize)
+        .childOption(ChannelOption.SO_KEEPALIVE, true)
+        .childOption(ChannelOption.TCP_NODELAY, true)
+        .childHandler(new ChannelInitializer<SocketChannel>() {
+            @Override
+            public void initChannel(SocketChannel ch) {
+                ch.pipeline()
+                    .addLast(new IdleStateHandler(channelMaxReadIdleSeconds, 0, 0))
+                    .addLast(new ProtocolDetectHandler(new ProtocolDetector[] {
+                        new Http2Detector(getChannelHandlers()),
+                        new SeataDetector(getChannelHandlers()),
+                        new HttpDetector()
+                    }));
+            }
+        });
+    this.serverBootstrap.bind(port).sync();
+    // 绑定成功后注册到注册中心（见 9.9.1）
+}
+```
+
+> **协议探测机制**：Seata Server 同时支持 Seata 协议、HTTP/2（gRPC）和 HTTP。`ProtocolDetectHandler` 根据魔数（Seata 协议魔数 `0xDABB`）自动识别协议类型，分发到对应 Handler 链。详见第十章。
+
+### 9.11 关闭流程
+
+Server 关闭通过 Spring `DisposableBean` 机制触发，**不使用 ShutdownHook**（避免与 Spring 顺序冲突，见 [issue #4028](https://github.com/seata/seata/issues/4028)）。
+
+```mermaid
+sequenceDiagram
+    participant Spring as Spring 容器
+    participant Runner as ServerRunner
+    participant List as DISPOSABLE_LIST
+    participant Coord as DefaultCoordinator
+    participant Netty as NettyRemotingServer
+    participant Reg as RegistryService
+    participant SH as SessionHolder
+
+    Spring->>Runner: destroy()
+    Runner->>List: 遍历 DISPOSABLE_LIST
+    List->>Coord: destroy()
+    Coord->>Coord: 1. shutdown 所有定时任务<br/>(retryRollbacking/retryCommitting/<br/>asyncCommitting/timeoutCheck/undoLogDelete)
+    Coord->>Coord: awaitTermination(5s)
+    Coord->>Netty: 2. destroy()
+    Netty->>Reg: unregister(Instance)
+    Netty->>Reg: close()
+    Netty->>Netty: shutdown EventLoopGroup
+    Coord->>SH: 3. SessionHolder.destroy()
+```
+
+- **`ServerRunner.destroy()`**（行 80-93）：遍历 `DISPOSABLE_LIST` 依次调用 `disposable.destroy()`
+- **`DefaultCoordinator.destroy()`**（行 816-845）：严格三步顺序
+  1. 关闭所有定时任务线程池并 `awaitTermination`（最多 5s）
+  2. 关闭 Netty（`NettyRemotingServer.destroy()` → `NettyServerBootstrap.shutdown()` 注销注册中心 + 关闭 EventLoopGroup）
+  3. 销毁 `SessionHolder`（关闭数据源/连接池）
+- **注册中心注销**：`NettyServerBootstrap.shutdown()`（行 214-229）遍历 `MultiRegistryFactory.getInstances()`，调用 `unregister` + `close`，然后 `sleep(serverShutdownWaitTime)` 等待在途请求处理完
+
+> **注册顺序**：`Server.start()` 中通过 `ServerRunner.addDisposable(coordinator)` 将 coordinator 加入销毁列表（行 111），关闭时先关 coordinator（含 Netty），再关其他 Disposable。
+
 ---
 
 ## 十、通信架构
