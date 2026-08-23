@@ -17,6 +17,8 @@
 5. [application 配置文件加载原理](#五application-配置文件加载原理)
 6. [@Conditional 条件注解实现原理](#六conditional-条件注解实现原理)
 7. [五大原理的关联：一张全景图](#七五大原理的关联一张全景图)
+8. [fatjar 可执行 Jar 实现原理](#八fatjar-可执行-jar-实现原理)
+9. [Actuator 实现原理：/actuator 端点是谁在响应](#九actuator-实现原理)
 
 ---
 
@@ -1162,4 +1164,429 @@ flowchart TB
 
 ---
 
+## 八、fatjar 可执行 Jar 实现原理
+
+fatjar（可执行 jar）的完整实现位于 `spring-boot-project/spring-boot-tools/spring-boot-loader` 模块（包 `org.springframework.boot.loader`，下文简写 `LOADER`）--它是**零依赖的纯 JDK 实现**（主代码不依赖 Spring），由打包插件（`spring-boot-loader-tools/Packager.java` + maven/gradle 插件）在构建期把 loader 类注入 fatjar 根目录并改写 MANIFEST。
+
+### 8.1 fatjar 内部结构与 MANIFEST
+
+```
+app.jar
+├── META-INF/MANIFEST.MF          # Main-Class: JarLauncher / Start-Class: com.x.App
+├── org/springframework/boot/loader/   # loader 类本身（内嵌到 fatjar 根目录，系统类加载器可见）
+└── BOOT-INF/
+    ├── classes/                  # 应用自己的类与资源（等价普通 jar 的 classpath 根）
+    ├── classpath.idx             # 类路径顺序索引（2.3+ 引入）
+    ├── layers.idx                # 分层索引（配合 jarmode-layertools，Docker 分层构建）
+    └── lib/                      # 全部依赖 jar，STORED（不压缩）方式存放
+```
+
+- **war 差异**：应用类在 `WEB-INF/classes`，依赖在 `WEB-INF/lib` 与 `WEB-INF/lib-provided`（provided 作用域依赖，传统容器部署时由容器提供，`java -jar` 直跑也需要，所以 `WarLauncher` 把两个目录都算进 classpath）；
+- **打包端关键动作**（`spring-boot-loader-tools/loader/tools/Packager.java`）：
+  - `buildManifest()`（L313-320）：把用户原 main 类挪到 `Start-Class`，`Main-Class` 改写为 launcher 类（`Layouts.java`：jar -> `JarLauncher`，war -> `WarLauncher`，zip 默认 -> `PropertiesLauncher`）；
+  - **BOOT-INF/lib 下的嵌套 jar 必须以 STORED（非 DEFLATED）方式写入**--这是 loader 能把嵌套 jar 当作随机访问数据段直接解析的前提（运行时还会强制校验，见 8.4）。
+
+### 8.2 完整启动链路
+
+```mermaid
+flowchart TD
+    A["java -jar app.jar"] --> B["JVM 读 MANIFEST.MF<br/>Main-Class = JarLauncher"]
+    B --> C["JarLauncher.main(args)<br/>JarLauncher.java:64-66"]
+    C --> D["new JarLauncher().launch(args)<br/>Launcher.java:51"]
+    D --> E["createArchive()<br/>Launcher.java:124-137<br/>CodeSource.getLocation 定位自身<br/>目录->ExplodedArchive / jar文件->JarFileArchive"]
+    D --> F["JarFile.registerUrlProtocolHandler()<br/>JarFile.java:430-436 ★接管 jar: 协议"]
+    D --> G["getClassPathArchivesIterator()<br/>ExecutableArchiveLauncher.java:120-128<br/>isSearchCandidate: BOOT-INF/ 前缀<br/>isNestedArchive: classes/ 目录 + lib/*.jar"]
+    G --> H["JarFileArchive.getNestedArchive<br/>BOOT-INF/classes -> NESTED_DIRECTORY 虚拟 jar<br/>BOOT-INF/lib/x.jar -> NESTED_JAR 字节区间"]
+    H --> I["createClassLoader<br/>new LaunchedURLClassLoader(urls, appClassLoader)"]
+    I --> J["launch(args, mainClass, classLoader)<br/>Launcher.java:93-96<br/>Thread.currentThread.setContextClassLoader"]
+    J --> K["MainMethodRunner.run()<br/>MainMethodRunner.java:45-50<br/>Class.forName(Start-Class, false, TCCL)<br/>mainMethod.invoke(null, args)"]
+    K --> L["用户 Start-Class.main()<br/>-> SpringApplication.run()"]
+```
+
+关键源码细节：
+
+- `JarLauncher` 的过滤规则（`LOADER/JarLauncher.java:35-40`）：
+
+```java
+static final EntryFilter NESTED_ARCHIVE_ENTRY_FILTER = (entry) -> {
+    if (entry.isDirectory()) {
+        return entry.getName().equals("BOOT-INF/classes/");   // classes 目录
+    }
+    return entry.getName().startsWith("BOOT-INF/lib/");       // lib 下的 jar
+};
+```
+
+- `getMainClass()`（`ExecutableArchiveLauncher.java:88-98`）：读 MANIFEST 的 `Start-Class`，缺失直接抛 `IllegalStateException`；
+- `Launcher.launch` L56-57 支持 **jarmode 钩子**：`-Djarmode=layertools` 时不跑用户 main，而是执行 `JarModeLauncher`（Docker 分层提取靠它）；
+- `LaunchedURLClassLoader.loadClass`（L121-131）对 `org.springframework.boot.loader.jarmode.` 前缀类做特殊处理--**从父加载器读字节流、但由子加载器 defineClass**（故意破坏双亲委派），否则 jarmode 类会落在系统 classloader 里而找不到 fatjar 内的依赖。
+
+### 8.3 Archive 抽象与类加载架构
+
+`Archive` 接口（`LOADER/archive/Archive.java:34`）：`getUrl()` / `getManifest()` / `getNestedArchives(searchFilter, includeFilter)`。两个实现：
+
+- **`JarFileArchive`**：核心是 `getNestedArchive(Entry)`（:110-122）--entry comment 以 `UNPACK:` 开头则先解压到临时目录；否则 `jarFile.getNestedJarFile(jarEntry)` **直接在外层 jar 的数据段上再建 JarFile，全程不落盘**；
+- **`ExplodedArchive`**：以目录为根（IDE 里 exploded 运行时用），URL 全是普通 `file:`，完全绕过自定义协议。
+
+类加载层级：
+
+```mermaid
+flowchart TB
+    A["Bootstrap ClassLoader<br/>JDK 核心类"] --> B["Platform ClassLoader<br/>java.sql 等"]
+    B --> C["Application / System ClassLoader<br/>loader 类自身 JarLauncher 在这里<br/>能看见 fatjar 根目录的 loader 类"]
+    C -->|"parent 双亲委派"| D["LaunchedURLClassLoader<br/>extends URLClassLoader<br/>urls = BOOT-INF/classes + BOOT-INF/lib/*.jar<br/>应用所有类与依赖都从这里加载"]
+    D --> E["Thread.contextClassLoader<br/>launch 时被设为 LaunchedURLClassLoader<br/>Launcher.java:94"]
+    style D fill:#e8f5e9
+```
+
+- `LaunchedURLClassLoader.loadClass`（:120-154）顺序：jarmode 特例 -> exploded 直接 super -> `Handler.setUseFastConnectionExceptions(true)` 包裹 -> `definePackageIfNecessary` -> `super.loadClass`；
+- **definePackage 修正**（:191-233）--理解这个就理解了为何要重写：JDK `URLClassLoader.definePackage` 只会用 URL 本身的 manifest，而 fatjar 的每个 URL 都是嵌套 URL，原生 handler 拿不到正确的嵌套 manifest，会导致 `Package` 的版本/Sealed 属性丢失。Boot 的做法是在 findClass 前**主动遍历 getURLs()**，对每个 URL `openConnection()`，找到同时含目标 class entry、包目录 entry 与 manifest 的 jar，用**该嵌套 jar 自己的 MANIFEST** `definePackage`；
+- **资源一致性**：`getResources("META-INF/spring.factories")` 能正确返回所有嵌套 jar + BOOT-INF/classes 中的命中项（Spring Boot 的 SPI 加载、`@Configuration` 扫描完全依赖这一点）；fast-exception 优化延续到**枚举消费时刻**（`UseFastConnectionExceptionsEnumeration`，:315-346）。
+
+### 8.4 JarFile 体系：zip 中央目录随机访问（核心）
+
+#### 为什么 JDK 自带的 `java.util.jar.JarFile` / `URLClassLoader` 处理不了嵌套 jar--根本问题
+
+1. **`JarFile` 构造器只接受 `java.io.File`**。`BOOT-INF/lib/spring-web.jar` 是外层 zip 里的一个 entry，磁盘上不存在独立文件。JDK 的兜底行为是**解压到临时目录**再打开--启动慢、临时文件泄漏、签名/资源缓存失效；
+2. **JDK 的 `jar:` 协议 handler 只认一层 `!/`**。`sun.net.www.protocol.jar.Handler` 无法理解 `jar:file:/app.jar!/BOOT-INF/lib/a.jar!/...` 的多层嵌套；
+3. **`JarFile` 打开时顺序读整个流校验签名**，顺序访问模型对"只读一个 class 文件"的代价不可接受。
+
+Boot loader 的解法：**外层 jar 用 `RandomAccessFile` 打开，按 zip 格式直接在原文件的字节区间上解析嵌套 jar 的中央目录，零解压、零临时文件、惰性按需解压单个 entry**。
+
+#### 关键实现
+
+**JarFile 构造器**（`LOADER/jar/JarFile.java:128-161`）：
+
+```java
+private JarFile(RandomAccessDataFile rootFile, String pathFromRoot, RandomAccessData data,
+        JarEntryFilter filter, JarFileType type, Supplier<Manifest> manifestSupplier) {
+    super(rootFile.getFile());
+    super.close();                                  // 立刻关掉父类句柄，全靠自己解析
+    CentralDirectoryParser parser = new CentralDirectoryParser();
+    this.entries = parser.addVisitor(new JarFileEntries(this, filter));
+    this.data = parser.parse(data, filter == null); // 解析中央目录
+}
+```
+
+- `rootFile` 永远指向**最外层物理文件**；嵌套 JarFile 通过 `data`（某个字节子区间）+ `pathFromRoot` 区分；
+- **目录型嵌套**（BOOT-INF/classes，:315-325）：用 `JarEntryFilter` 把外层 entry 名去掉前缀映射成"虚拟 jar"的 entry 集合（type = NESTED_DIRECTORY），共享外层 manifestSupplier（保证 definePackage 拿到 fatjar 主 MANIFEST）；
+- **文件型嵌套**（BOOT-INF/lib/*.jar，:327-337）--**"嵌套 jar 必须不压缩"的运行时强制校验**：
+
+```java
+if (entry.getMethod() != ZipEntry.STORED) {
+    throw new IllegalStateException("nested jar files must be stored without compression...");
+}
+RandomAccessData entryData = this.entries.getEntryData(entry.getName());
+return new JarFile(this.rootFile, pathFromRoot + "!/" + entry.getName(), entryData, JarFileType.NESTED_JAR);
+```
+
+只有 STORED，字节子区间才能直接当作 zip 文件去解析其中的中央目录。
+
+**中央目录解析流水线**：
+
+```mermaid
+flowchart LR
+    A["CentralDirectoryEndRecord<br/>从文件尾部按256字节块向前搜 EOCD 签名<br/>支持 Zip64 定位<br/>CentralDirectoryEndRecord.java:60-78"] --> B["getCentralDirectory<br/>EOCD 记录的 offset/length<br/>getSubsection 得到目录数据段（视图非拷贝）"]
+    B --> C["CentralDirectoryParser<br/>一次读整个目录到 byte[]<br/>逐条解析46字节头+变长name/extra<br/>-> CentralDirectoryFileHeader"]
+    C --> D["JarFileEntries<br/>hashCodes/offsets/positions 三数组<br/>按hash快排 + Arrays.binarySearch 查找<br/>约10500个entry仅占~122K内存"]
+    D --> E["getEntryData<br/>重读 local file header 拿真实偏移<br/>兼容 aspectjrt 等目录与local头不一致的jar"]
+    E --> F["getInputStream<br/>仅此刻才解压这一段<br/>DEFLATED -> ZipInflaterInputStream raw inflate"]
+    style F fill:#fff3e0
+```
+
+- `RandomAccessData.getSubsection(offset, length)` 返回**视图而非拷贝**（`RandomAccessDataFile.java:81-86`），内部惰性打开 `RandomAccessFile`，所有读 `synchronized(monitor) { seek; read }`；
+- **签名策略**：构造期遍历中央目录时探测 `META-INF/**.SF` entry 置 `signed` 标志；未签名 jar（绝大多数依赖）`getCertificates()` 直接返回 `NONE`，**完全跳过 JDK 全流签名校验**（启动加速关键）；签名 jar 才回退用 `JarInputStream` 顺序读一遍取证书并按 entry 缓存（`JarFileEntries.java:334-355`）；
+- **Multi-Release jar 支持**：`getEntry`（:228-243）若 MANIFEST 有 `Multi-Release: true`，从运行时版本向下逐级尝试 `META-INF/versions/N/<name>`；
+- **零 String 分配的字节切片工具**（`AsciiBytes`/`Bytes`）：hash/startsWith 全在 byte[] 上做，避免解析期产生海量字符串。
+
+### 8.5 URL 协议层：接管 `jar:` 协议
+
+**注册机制**（`JarFile.registerUrlProtocolHandler()`，:430-450）：
+
+```java
+String handlers = System.getProperty(PROTOCOL_HANDLER, "");        // java.protocol.handler.pkgs
+System.setProperty(PROTOCOL_HANDLER,
+    (handlers.isEmpty() ? "" : handlers + "|") + "org.springframework.boot.loader");
+resetCachedUrlHandlers();       // URL.setURLStreamHandlerFactory(null) -> 清 JDK handler 缓存
+```
+
+原理：JDK `URL` 查找协议 handler 时会扫描 `java.protocol.handler.pkgs` 列出的包，对协议 `jar` 找 `<pkg>.jar.Handler`--loader 的类恰好位于 `org.springframework.boot.loader.jar.Handler`（**包名必须以 `.jar` 结尾、类必须叫 Handler**），追加后 JDK 命中它，从而**替换** `sun.net.www.protocol.jar.Handler`。`Handler.captureJarContextUrl()`（:414-440）在替换前先捕获一个仍指向原生 handler 的 URL 留作 fallback。exploded 模式全是 `file:` URL，无需注册。
+
+**嵌套 URL 下钻**（`JarURLConnection.get(URL, JarFile)`，`JarURLConnection.java:244-267`）--多层嵌套的核心：
+
+```java
+while ((separator = spec.indexOf(SEPARATOR, index)) > 0) {      // 逐个 !/ 切分
+    JarEntryName entryName = JarEntryName.get(spec.subSequence(index, separator));
+    JarEntry jarEntry = jarFile.getJarEntry(entryName.toCharSequence());
+    if (jarEntry == null) { return notFound(...); }
+    jarFile = jarFile.getNestedJarFile(jarEntry);               // ★下钻到下一层嵌套 jar
+    index = separator + SEPARATOR.length();
+}
+return new JarURLConnection(url, jarFile.getWrapper(), jarEntryName);  // 最后一段是 entry 名
+```
+
+即 `jar:file:/app.jar!/BOOT-INF/lib/a.jar!/com/Foo.class` 中 `!/` 分隔的每一段都当作上一层 jar 的 entry，逐层下钻。返回的连接包 `JarFileWrapper`（关闭时不误关共享的底层 JarFile）。`rootFileCache`（SoftReference）保证同一外层 jar 只被解析一次。
+
+**fast-exception 优化**：类加载扫几百个 jar 找一个资源时，用静态预建的 `NOT_FOUND_CONNECTION`/`FILE_NOT_FOUND_EXCEPTION`（:42-46）+ `useFastExceptions` ThreadLocal，避免为每个 miss 构造带堆栈的异常。
+
+### 8.6 fatjar 启动时序图
+
+```mermaid
+sequenceDiagram
+    participant JVM as JVM
+    participant JL as JarLauncher<br/>(系统类加载器)
+    participant JF as loader JarFile
+    participant LCL as LaunchedURLClassLoader
+    participant APP as Start-Class
+
+    JVM->>JL: 读 Main-Class 启动 main(args)
+    JL->>JL: createArchive -> JarFileArchive(app.jar)
+    JL->>JF: registerUrlProtocolHandler<br/>接管 jar: 协议
+    JL->>JF: getNestedJarFile(BOOT-INF/classes)<br/>NESTED_DIRECTORY 虚拟 jar
+    JL->>JF: getNestedJarFile(BOOT-INF/lib/*.jar)<br/>NESTED_JAR 字节区间<br/>校验 STORED 不压缩
+    Note over JF: 零解压：RandomAccessData 视图<br/>+ 自解析 zip 中央目录
+    JL->>LCL: new LaunchedURLClassLoader(urls, appClassLoader)
+    JL->>JL: TCCL = LaunchedURLClassLoader
+    JL->>APP: MainMethodRunner<br/>Class.forName(Start-Class, false, TCCL)
+    APP->>LCL: 加载应用类
+    LCL->>JF: findClass -> JarURLConnection 下钻多层 !/
+    Note over LCL: definePackage 用嵌套 jar 的 MANIFEST<br/>fast-exception 跳过 miss 堆栈
+    APP->>APP: main() -> SpringApplication.run()
+    Note over APP: 此后走第二节启动流程
+```
+
+### 8.7 PropertiesLauncher 简述
+
+外部化启动器（zip 默认 layout）：属性来自 `loader.properties`（`loader.config.location` 指定，查找 `file:${loader.home}/`、`classpath:`、`classpath:BOOT-INF/classes/`）。关键属性：`loader.main`（回退 Start-Class）、`loader.path`（外部 classpath，支持目录/jar/`jar!dir` 嵌套写法）、`loader.classLoader`（自定义类加载器类名）。BOOT-INF/classes、BOOT-INF/lib 始终会被加入。
+
+### 8.8 设计精髓总结
+
+Spring Boot loader **没有发明新的类加载协议**，而是：
+
+1. **`RandomAccessData` 字节区间视图 + 自解析 zip 中央目录**，让嵌套 jar 可以像物理文件一样被随机访问（零解压、零临时文件、惰性单 entry 解压）；
+2. 通过 `java.protocol.handler.pkgs` **接管 `jar:` 协议**，使这一能力对标准 `URLClassLoader` 完全透明；
+3. `LaunchedURLClassLoader` 的 **definePackage 修正**（嵌套 MANIFEST 绑定到 Package）与 **fast-exception 优化**，保证与 JDK 工具链（`JarURLConnection`、`getResources`、包元数据、签名 API）的语义兼容；
+4. 配合打包端的 **STORED 不压缩约定**、`classpath.idx` 顺序索引、`layers.idx` 分层索引与 `-Djarmode=layertools` 钩子，形成完整的可执行 jar 体系。
+
+> 3.2 才将这些类迁移到 `org.springframework.boot.loader.launch` 等新包并 JPMS 模块化；3.0.0 仍是根包布局，`Handler` 所在包 `org.springframework.boot.loader.jar` 正好满足 JDK 协议 handler 命名约定。
+
+---
+
+## 九、Actuator 实现原理
+
+> 路径约定：**ACT** = `spring-boot-project/spring-boot-actuator/.../boot/actuate`，**AUTO** = `spring-boot-project/spring-boot-actuator-autoconfigure/.../boot/actuate/autoconfigure`。
+>
+> 核心问题先答：**访问 `/actuator/health` 时，响应者不是用户的 Controller，而是一个 Spring MVC 自定义 `HandlerMapping`--`WebMvcEndpointHandlerMapping`（order=-100，优先于 `RequestMappingHandlerMapping` 的 0）**。它在初始化时把所有 `@Endpoint` bean 的操作方法动态注册为标准 `RequestMappingInfo`（如 `/actuator/health`），处理器是 Actuator 内部私有的迷你 handler `OperationHandler`（一个带 `@ResponseBody` 的 `handle()` 方法）；真正业务由 `ReflectiveOperationInvoker` 反射调用 `HealthEndpointWebExtension.health(...)` 完成；返回值实现 `OperationResponseBody` 标记接口，命中 3.0 新增的**隔离专用 ObjectMapper** 注册，由 `MappingJackson2HttpMessageConverter` 写出 JSON。
+
+### 9.1 端点定义与发现机制
+
+**注解层**（`ACT/endpoint/annotation/`）：
+
+- `@Endpoint`（:52-69）：`id` + `enableByDefault`，"最低公分母"，可被 `@EndpointWebExtension`/`@EndpointJmxExtension` 按暴露技术扩展；
+- `@ReadOperation/@WriteOperation/@DeleteOperation`（HTTP 动词 GET/POST/DELETE）+ `@Selector`（路径变量，`SINGLE` 映射 `{name}`，`ALL_REMAINING` 映射 `{*name}` 收 `String[]`）；
+- `@EndpointWebExtension` = `@EndpointExtension(endpoint = X.class, filter = WebEndpointFilter.class)`--health 的**双轨制**：JMX 用 `HealthEndpoint` 本体，HTTP 用 `HealthEndpointWebExtension`。
+
+**发现流程**（`ACT/endpoint/annotation/EndpointDiscoverer.java`，懒发现 + volatile 缓存）三步：
+
+1. `createEndpointBeans()`（:128-141）：`beanNamesForAnnotationIncludingAncestors(context, Endpoint.class)` 按**注解**扫描容器（含父容器--独立管理端口的 child context 场景关键），同 id 重复直接失败；
+2. `addExtensionBeans()`（:149-176）：扫描 `@EndpointExtension`，反查出被扩展端点的 id 后挂上；
+3. `convertToEndpoints()`（:178-186）：`isEndpointExposed()` 执行**暴露过滤**（include/exclude 生效点）；`convertToEndpoint`（:188-204）收集本体操作后，对扩展 bean 以 `replaceLast=true` 再收集--**同 key 的本体操作被扩展操作顶掉**，这就是 `HealthEndpointWebExtension.health()` 替换 `HealthEndpoint.health()` 的机制；`OperationKey` 重复且未被替换则抛 `IllegalStateException`。
+
+**方法 -> Operation**（`DiscoveredOperationsFactory.java:71-105`）：`MethodIntrospector.selectMethods` 枚举方法 -> 构造 `DiscoveredOperationMethod` -> `new ReflectiveOperationInvoker(target, method, parameterValueMapper)`（:91）-> `applyAdvisors()` 套用 `OperationInvokerAdvisor`（如 `CachingOperationInvokerAdvisor`，对应 `management.endpoint.<id>.cache.time-to-live` 读操作缓存）。
+
+**WebOperationRequestPredicate 构造规则**（`RequestPredicateFactory.java:54-144`）--全部在**启动期**算好，请求期只做匹配：
+
+| 谓词 | 规则 |
+|---|---|
+| path | rootPath + 每个 `@Selector` 追加 `/{参数名}`；`ALL_REMAINING` 为 `{*参数名}` |
+| httpMethod | READ->GET，WRITE->POST，DELETE->DELETE |
+| consumes | 仅 POST 且有非 @Selector 参数（请求体）时 `application/json` |
+| produces | 显式声明 > 返回 `Resource` 时 `application/octet-stream` > 否则 `EndpointMediaTypes.getProduced()` |
+
+`EndpointMediaTypes.DEFAULT`（`ACT/endpoint/web/EndpointMediaTypes.java:39-41`）= **`application/vnd.spring-boot.actuator.v3+json, application/vnd.spring-boot.actuator.v2+json, application/json`**--"为什么是 JSON"的第一层答案：produces 谓词本身就只声明 JSON 媒体类型。
+
+### 9.2 注册为 HTTP 路由："谁响应"的装配侧
+
+**装配入口**：`@ManagementContextConfiguration`（`AUTO/web/ManagementContextConfiguration.java:48`，带 ANY/SAME/CHILD 类型）的 10 个实现经 `ManagementContextConfiguration.imports` 导入--这套机制保证同端口与独立 management child context 两种形态下端点装配一致。
+
+`AUTO/endpoint/web/servlet/WebMvcEndpointManagementContextConfiguration.java` 核心 bean `webEndpointServletHandlerMapping`（:83-100）：汇聚 `WebEndpointsSupplier`（@Endpoint）+ `ServletEndpointsSupplier` + `ControllerEndpointsSupplier` 三类端点，读 `management.endpoints.web.base-path`（默认 `/actuator`），构造 `EndpointLinksResolver`，`new WebMvcEndpointHandlerMapping(...)`。
+
+`WebMvcEndpointHandlerMapping`（`ACT/endpoint/web/servlet/`）继承链：
+
+```java
+public class WebMvcEndpointHandlerMapping extends AbstractWebMvcEndpointHandlerMapping { ... }
+// 构造器 setOrder(-100)                      WebMvcEndpointHandlerMapping.java:66-72
+
+public abstract class AbstractWebMvcEndpointHandlerMapping
+        extends RequestMappingInfoHandlerMapping implements InitializingBean { ... }
+// 即：一个完整的标准 Spring MVC HandlerMapping        :90
+```
+
+**DispatcherServlet 如何发现它**：`DispatcherServlet.initHandlerMappings()`（Spring Framework）通过 `beansOfTypeIncludingAncestors(context, HandlerMapping.class)` 收集所有 HandlerMapping bean 并按 order 排序：
+
+| HandlerMapping | order | 处理什么 |
+|---|---|---|
+| `WebMvcEndpointHandlerMapping` | **-100** | `/actuator/**` 端点 |
+| `ControllerEndpointHandlerMapping` | -100 | `@ControllerEndpoint` |
+| `RequestMappingHandlerMapping` | 0 | 用户 `@RequestMapping` |
+
+`DispatcherServlet.getHandler()` 按 order 升序遍历，第一个命中者获胜--**用户在 `/actuator/xxx` 下自定义的 `@RequestMapping` 会被无声遮蔽**。
+
+**注册流程**（`AbstractWebMvcEndpointHandlerMapping.java`）：
+
+- `afterPropertiesSet()`（:142-147）-> `initHandlerMethods()`（:150-159）：遍历端点快照的每个 operation 调 `registerMappingForOperation`，`shouldRegisterLinksMapping` 时再注册根路径 links 映射。**不扫描容器 bean**（`isHandler()` 恒 false），端点集合是构造传入的快照；
+- `registerMapping()`（:177-183）：`registerMapping(createRequestMappingInfo(predicate, path), new OperationHandler(servletWebOperation), this.handleMethod)`--`handleMethod` 是构造器（:103-104）预解析的 `OperationHandler#handle(HttpServletRequest, Map)` 反射引用；
+- `createRequestMappingInfo()`（:198-203）：`RequestMappingInfo.paths(endpointMapping.createSubPath(path)).methods(GET).produces(三种JSON).build()`--**`/actuator/health` 的 RequestMappingInfo 就在这里诞生**。
+
+**`/actuator` 根路径 links 响应**：`WebMvcLinksHandler.links()`（`WebMvcEndpointHandlerMapping.java:82-98`，`@ResponseBody`）调 `EndpointLinksResolver.resolveLinks(requestUrl)`（`web/EndpointLinksResolver.java:68-83`：先放 `self` 再遍历所有端点，`Link` 即 `{href, templated}`），以 `OperationResponseBody.of()` 包裹返回--`{"_links":{"self":...,"health":...}}` 的生产者就是它。
+
+### 9.3 请求处理与 JSON 序列化：完整证据链
+
+**OperationHandler 与调用链**（`AbstractWebMvcEndpointHandlerMapping.java:412-424, 301-322`）：
+
+```java
+private static final class OperationHandler {
+    @ResponseBody
+    Object handle(HttpServletRequest request, @RequestBody(required = false) Map<String, String> body) {
+        return this.operation.handle(request, body);
+    }
+}
+```
+
+`ServletWebOperationAdapter.handle()`（:301-322）组装参数与上下文：
+
+1. `getArguments()`（:329-353）：合并 URI 模板变量、`{*name}` 剩余路径段（路径 token 与匹配 pattern token 的差集）、POST body、query 参数；
+2. 构造 `ServletSecurityContext`（:466-484，委托 `request.getUserPrincipal()`--health details 权限判断的数据源）、`ProducibleOperationArgumentResolver`（按 `Accept` 头解析 ApiVersion）、`WebServerNamespace` resolver；
+3. `new InvocationContext(...)` -> `operation.invoke(context)`；
+4. `handleResult()`（:373-386）：null -> GET 404 / 非 GET 204；**`WebEndpointResponse` -> `ResponseEntity.status(response.getStatus())`--HTTP 状态码透传点**。
+
+invoke 链：`AbstractDiscoveredOperation.invoke`（`annotation/AbstractDiscoveredOperation.java:59-61`）-> `CachingOperationInvoker`（若配 TTL）-> **`ReflectiveOperationInvoker.invoke()`**（`invoke/reflect/ReflectiveOperationInvoker.java:69-107`）：
+
+```java
+public Object invoke(InvocationContext context) {
+    validateRequiredParameters(context);               // @Nullable 缺失检查
+    Object[] resolvedArguments = resolveArguments(context);  // 类型转换 + ApiVersion/SecurityContext 注入
+    return ReflectionUtils.invokeMethod(method, this.target, resolvedArguments);  // target = 端点 bean
+}
+```
+
+**"为什么一定是 JSON"--三层机制**：
+
+1. **produces 谓词**（启动期）：`WebOperationRequestPredicate.produces` = 三种 JSON 媒体类型（9.1 节）；
+2. **@ResponseBody**：`OperationHandler.handle` 的返回值走 `RequestResponseBodyMethodProcessor` -> message converter，而非视图渲染；
+3. **隔离 ObjectMapper（3.0 新特性，决定性一层）**：
+   - `ACT/endpoint/OperationResponseBody.java:31-43`：标记接口 + `of(Map)` 工厂；`HealthComponent`、`CompositeHealth`、`SystemHealth`、links 的 `OperationResponseBodyMap` 都实现它；
+   - `AUTO/endpoint/jackson/JacksonEndpointAutoConfiguration.java:43-52`（`management.endpoints.jackson.isolated-object-mapper` 默认 true）：构造一个**与应用主 ObjectMapper 完全无关**的 mapper（禁用日期时间戳、`NON_NULL`）；
+   - 接线：`EndpointObjectMapperWebMvcConfigurer`（`WebMvcEndpointManagementContextConfiguration.java:144-171`）实现 `configureMessageConverters`，对每个 `MappingJackson2HttpMessageConverter` 执行：
+
+```java
+converter.registerObjectMappersForType(OperationResponseBody.class, (associations) -> {
+    MEDIA_TYPES.forEach((mimeType) -> associations.put(mimeType, this.endpointObjectMapper.get()));
+});
+```
+
+   - 运行期命中（spring-web `AbstractJackson2HttpMessageConverter.selectObjectMapper`）：`OperationResponseBody.isAssignableFrom(targetType)` 命中则取隔离 mapper；**命中类型但媒体类型非 JSON 时直接返回 null（不可写）--从机制上排除了这些类型返回 HTML/其他格式的可能**。
+   - 序列化注解塑造输出形态：`HealthComponent.getStatus()` 标 `@JsonUnwrapped`（status 展开为顶层 `"status":"UP"`）、`@JsonInclude(NON_EMPTY)`--所以默认（show-details=never）输出就是 `{"status":"UP"}`。
+
+**WebFlux 对照**（`ACT/endpoint/web/reactive/AbstractWebFluxEndpointHandlerMapping.java`）：同样 order=-100、RequestMappingInfo 注册；阻塞 invoke 由 `ReactiveWebOperationAdapter` 包成 `Mono.fromCallable(...).subscribeOn(Schedulers.boundedElastic())`（:235-248）避免阻塞事件循环；JSON 编码经 `ServerCodecConfigurer` 后置处理向 `Jackson2JsonEncoder` 注册同样的类型->mapper 映射。
+
+### 9.4 /actuator/health 完整请求时序
+
+```mermaid
+sequenceDiagram
+    participant B as 浏览器/curl
+    participant T as 内嵌 Tomcat
+    participant DS as DispatcherServlet
+    participant HM as WebMvcEndpointHandlerMapping<br/>(order=-100)
+    participant OH as OperationHandler
+    participant IV as ReflectiveOperationInvoker
+    participant HE as HealthEndpointWebExtension
+    participant HI as 各 HealthIndicator
+    participant MC as MessageConverter
+
+    B->>T: GET /actuator/health
+    T->>DS: FilterChain -> doDispatch()
+    DS->>DS: getHandler: 遍历 HandlerMapping<br/>WebMvcEndpointHandlerMapping 命中<br/>(RequestMappingHandlerMapping 未轮到)
+    DS->>HM: RequestMappingInfo(/actuator/health, GET, produces=JSON) 匹配
+    HM-->>DS: OperationHandler#handle 的 HandlerMethod
+    DS->>OH: RequestMappingHandlerAdapter 反射调用 handle(req, body)
+    OH->>OH: ServletWebOperationAdapter<br/>组装 InvocationContext<br/>(参数 + SecurityContext + ApiVersion)
+    OH->>IV: operation.invoke(context)
+    IV->>HE: 反射调用 health(apiVersion, namespace, securityContext)
+    Note over HE: HealthEndpointSupport.getHealth<br/>沿 path 下钻 HealthContributorRegistry<br/>聚合各指标
+    HE->>HI: getHealth(includeDetails)<br/>db/diskSpace/redis...
+    HI-->>HE: Health(status, details)
+    HE->>HE: SimpleStatusAggregator 取最坏状态<br/>DOWN > OUT_OF_SERVICE > UP > UNKNOWN
+    HE-->>OH: WebEndpointResponse(CompositeHealth, 200/503)
+    OH-->>DS: ResponseEntity.status(...).body(CompositeHealth)
+    DS->>MC: @ResponseBody -> RequestResponseBodyMethodProcessor
+    Note over MC: CompositeHealth 实现 OperationResponseBody<br/>selectObjectMapper 命中隔离 ObjectMapper<br/>非 JSON 媒体类型不可写
+    MC-->>T: ObjectMapper.writeValue -> JSON 字节
+    T-->>B: 200 {"status":"UP",...}
+```
+
+### 9.5 health 端点深入
+
+- **双轨制**：`HealthEndpoint`（`ACT/health/HealthEndpoint.java:41-42`，`@Endpoint(id="health")`）与 `HealthEndpointWebExtension`（:47-49，`@EndpointWebExtension`）**都继承 `HealthEndpointSupport`**--同一套聚合逻辑、不同方法签名；发现期 WebExtension 顶掉本体的同名操作，JMX discoverer 看不到 WebExtension（filter 是 `WebEndpointFilter`）；
+- **注册表**：`DefaultHealthContributorRegistry` 以 bean 名为指标名注册 `HealthIndicator`（叶子）/`CompositeHealthContributor`（复合）；响应式指标经 `AdaptedReactiveHealthContributors` 以 `.block()` 适配；
+- **聚合算法**（`HealthEndpointSupport.java:73-202`）：path 首段先匹配 group 名 -> `getAggregateContribution` 递归收集全部叶子指标（附慢指标告警，阈值 `management.endpoint.health.logging.slow-indicator-threshold`）-> `SimpleStatusAggregator`（默认顺序 `DOWN > OUT_OF_SERVICE > UP > UNKNOWN`，`management.endpoint.health.status.order` 可覆盖）**取最坏状态** -> `SystemHealth`/`CompositeHealth`；
+- **状态码映射**（`HealthEndpointWebExtension.health`，:78-90）：`HttpCodeStatusMapper.getStatusCode(status)`（默认 `UP->200, DOWN/OUT_OF_SERVICE->503`，`management.endpoint.health.status.http-mapping.*` 可覆盖）-> `WebEndpointResponse(health, statusCode)`；
+- **show-details 权限**：不在 Security filter 层，而在 `AutoConfiguredHealthEndpointGroup.showDetails(SecurityContext)`（`Show.NEVER/WHEN_AUTHORIZED/ALWAYS`，默认 NEVER）--未认证时 details/components 被裁掉，只剩 `{"status":"UP"}`；
+- **Availability Probes**：`AvailabilityProbesAutoConfiguration`（:73-95）--显式设置 `management.endpoint.health.probes.enabled` 优先，否则 **CloudPlatform 为 KUBERNETES 才启用**。为什么 K8s 要单独的 `/actuator/health/liveness|readiness`：liveness 只应反映进程内部状态（避免下游 DB 抖动触发无意义的容器重启），readiness 反映是否可接流量；`LivenessStateHealthIndicator`/`ReadinessStateHealthIndicator` 的状态来自 `ApplicationAvailability`（即启动流程第 ⑮/⑱ 步发布的 `AvailabilityChangeEvent`，与第二节的启动流程呼应）；`probes.add-additional-paths=true` 时额外挂 `/livez`、`/readyz`。
+
+### 9.6 暴露控制与独立管理端口
+
+- **默认只有 `/actuator/health` 可 HTTP 访问**：`WebEndpointProperties.Exposure` 默认 include 为空，`IncludeExcludeEndpointFilter`（`AUTO/endpoint/expose/`，:108-139）回退到 `EndpointExposure.WEB.getDefaultIncludes()` = `"health"`；JMX 侧默认 `*` 全开；
+- **enabled 与 exposed 是两道闸**：`management.endpoint.<id>.enabled`（`OnAvailableEndpointCondition` 评估）决定**端点 bean 是否存在**；exposure filter 决定**存在后是否暴露**；两者都过才注册路由；
+- **`management.server.port` ≠ server.port 时**：`ChildManagementContextInitializer`（`AUTO/web/server/`，:58-133）监听主上下文的 `WebServerInitializedEvent`，以主上下文为 parent 创建 child context（id `parent:management`，serverNamespace=`management`）并 refresh--**child context 的 `onRefresh()` 创建第二个 Tomcat**（与第四节内嵌容器原理完全同构）；`beanNamesForAnnotationIncludingAncestors` 让 child 能看到主上下文的全部 `@Endpoint` bean。
+
+### 9.7 端点机制架构图
+
+```mermaid
+flowchart TB
+    subgraph DISCOVER["启动期：发现与装配"]
+        A1["@Endpoint bean<br/>HealthEndpoint / InfoEndpoint / MetricsEndpoint ..."] --> A2["EndpointDiscoverer<br/>扫描注解 + 暴露过滤<br/>WebExtension 顶掉本体操作"]
+        A2 --> A3["WebEndpointDiscoverer<br/>方法 -> DiscoveredWebOperation<br/>+ WebOperationRequestPredicate<br/>path/httpMethod/produces 启动期定死"]
+        A3 --> A4["WebMvcEndpointManagementContextConfiguration<br/>new WebMvcEndpointHandlerMapping<br/>(order=-100) + EndpointLinksResolver"]
+        A4 --> A5["afterPropertiesSet -> registerMapping<br/>RequestMappingInfo:/actuator/health GET produces JSON<br/>handler = OperationHandler#handle"]
+        A5 --> A6["DispatcherServlet.initHandlerMappings<br/>收集全部 HandlerMapping 并按 order 排序"]
+    end
+
+    subgraph RUNTIME["请求期：路由与执行"]
+        B1["Tomcat Connector"] --> B2["DispatcherServlet.doDispatch"]
+        B2 --> B3["getHandler 遍历<br/>order=-100 的 actuator 映射<br/>先于 order=0 的用户映射"]
+        B3 --> B4["RequestMappingHandlerAdapter<br/>反射调用 OperationHandler.handle<br/>@ResponseBody + @RequestBody Map"]
+        B4 --> B5["ServletWebOperationAdapter<br/>组装 InvocationContext<br/>URI变量/路径段/body/query + SecurityContext"]
+        B5 --> B6["CachingOperationInvoker 可选"]
+        B6 --> B7["ReflectiveOperationInvoker<br/>ReflectionUtils.invokeMethod<br/>target = 端点/WebExtension bean"]
+    end
+
+    subgraph JSON["JSON 序列化层"]
+        C1["返回值 implements OperationResponseBody<br/>CompositeHealth / OperationResponseBodyMap"]
+        C2["EndpointObjectMapperWebMvcConfigurer<br/>registerObjectMappersForType"]
+        C3["隔离 ObjectMapper 默认开启<br/>禁日期时间戳 + NON_NULL"]
+        C4["selectObjectMapper isAssignableFrom 命中<br/>非 JSON 媒体类型不可写"]
+        C2 --> C3
+        C3 --> C4
+    end
+
+    DISCOVER --> RUNTIME --> JSON
+```
+
+### 9.8 其他端点与安全（速览）
+
+| 端点 | 类 | 说明 |
+|---|---|---|
+| info | `info/InfoEndpoint` | 聚合 `InfoContributor`（build/git...） |
+| metrics | `metrics/MetricsEndpoint` | `GET /actuator/metrics` 列名 + `GET /actuator/metrics/{name}?tag=a:b`，数据来自 Micrometer composite registry |
+| env | `env/EnvironmentEndpoint` | 暴露 Environment 全部 PropertySource，值经 `Sanitizer` 脱敏（呼应第五节的配置优先级链） |
+| beans / mappings / conditions | `BeansEndpoint` / `MappingsEndpoint` / `ConditionsReportEndpoint` | conditions 端点输出的正是第六节 `ConditionEvaluationReport` 的内容 |
+| threaddump / heapdump | 同模式 | heapdump 返回 `Resource`（produces=octet-stream） |
+
+- **JMX 侧**：`JmxEndpointDiscoverer` + `JmxEndpointExporter`（`afterPropertiesSet` 时 `MBeanServer.registerMBean`，响应同样经 Jackson JSON 化）；
+- **安全**：`EndpointRequest.toAnyEndpoint()/to(X.class)/toLinks()`（`AUTO/security/servlet/EndpointRequest.java`）生成感知 exposure 配置的 Spring Security matcher（未暴露的端点不在 matcher 中）。
+
+---
+
+
 *文档生成：基于 spring-boot-3.0.0 源码逐行研读整理；所有行号对应本仓库 `spring-boot-project/` 下的 3.0.0 版本源文件。*
+
