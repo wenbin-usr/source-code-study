@@ -241,9 +241,9 @@ flowchart TB
     subgraph SYNC["同步刷盘 SYNC_FLUSH"]
         S1[GroupCommitRequest<br/>nextOffset = wroteOffset+wroteBytes] --> S2[service.putRequest<br/>放入 requestsWrite 队列]
         S2 --> S3[GroupTransferService/GroupCommitService<br/>swap 读写队列]
-        S3 --> S4[mappedFileQueue.flush(0)<br/>force 刷盘]
+        S3 --> S4["mappedFileQueue.flush(0)<br/>force 刷盘"]
         S4 --> S5{flushedPosition >= nextOffset?}
-        S5 -- 是 --> S6[wakeupCustomer(PUT_OK)<br/>唤醒等待的发送线程]
+        S5 -- 是 --> S6["wakeupCustomer(PUT_OK)<br/>唤醒等待的发送线程"]
         S5 -- 否/超时 --> S7[FlushDiskWatcher 兜底<br/>超时返回 FLUSH_DISK_TIMEOUT<br/>默认 syncFlushTimeout=5s]
     end
 
@@ -252,7 +252,7 @@ flowchart TB
         A2 --> A3{flushCommitLogTimed?}
         A3 -- "true(默认)" --> A4[定时 500ms 醒来]
         A3 -- false --> A5[被 wakeup 立即唤醒]
-        A4 --> A6[flush(flushCommitLogLeastPages=4)<br/>攒满 4 页才刷]
+        A4 --> A6["flush(flushCommitLogLeastPages=4)<br/>攒满 4 页才刷"]
         A5 --> A6
         A6 --> A7["mappedByteBuffer.force() /<br/>transientStorePool: 先 commit 再 force"]
     end
