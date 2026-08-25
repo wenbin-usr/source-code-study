@@ -127,6 +127,12 @@ this.defaultMQProducer.getDefaultMQProducerImpl().start(false); // 内置生产�
 
 同一个 clientId（ip@instanceName）的所有消费者/生产者**共享一个 MQClientInstance**（`MQClientManager` 维护的实例工厂表）。
 
+几个容易踩坑的细节：
+
+1. **clientId 冲突 = 消费"丢消息"假象**：同一台机器上启动两个消费者进程且 instanceName 相同（默认 `DEFAULT`），clientId 一样 -> 共享同一个 MQClientInstance -> `registerConsumer` 时组名相同会注册失败（`RECREATE_CONSUMER_INSTANCE` 报错或静默复用），表现为"有消费者收不到消息"。解决：设置不同 `instanceName` 或 `-Drocketmq.client.name`。生产环境用 IP@instanceName 尚可，容器化环境必须显式区分。
+2. **内置生产者（`defaultMQProducer`）的用途**：MQClientInstance 启动时会启动一个内部 Producer（`:127` `start(false)`），专门用于**消费失败回发重试消息**（8.6 的降级路径）和事务消息回查--所以消费者进程里能看到一个 producer 的网络连接。
+3. **`rebalanceImmediately()`**：`start()` 末尾不等 20s 定时器，直接 wakeup RebalanceService 先跑一轮（`:676`），让新消费者尽快拿到队列。
+
 ---
 
 ## 3. RebalanceService：重平衡
@@ -364,6 +370,20 @@ this.pullAPIWrapper.pullKernelImpl(
 | 异常 | 网络失败 / Broker 流控（FLOW_CONTROL 响应码） | 延迟重试：Broker 流控 20ms（`:96`），其他异常 3s（`pullTimeDelayMillsWhenException`, `:88`）（`:399-410`） |
 
 **关键理解：拉取循环永不停止**（除非队列被 dropped）。没有新消息时每轮就是一个"挂起 15s -> 超时返回 NO_NEW_MSG -> 立即重新拉"的循环，这正是长轮询的客户端配合面。
+
+### 4.5 PullSysFlag：一次拉取请求的 4 位声明书
+
+（`common/.../sysflag/PullSysFlag.java:20-24`）请求头里的 `sysFlag` 是客户端能力/意图的位掩码，Broker 逐位读取改变处理行为：
+
+| 位 | 常量 | 含义 | Broker 侧行为 |
+|---|---|---|---|
+| 0x1 | `FLAG_COMMIT_OFFSET` | 请求头携带了本地进度 | 收到后顺手 `commitOffset` 持久化（第 6.4 节"捎带提交"的实现载体） |
+| 0x2 | `FLAG_SUSPEND` | 客户端支持长轮询挂起 | PULL_NOT_FOUND 时挂请求到 `PullRequestHoldService`（5.2 的 `hasSuspendFlag` 判断来源），否则立即返回空 |
+| 0x4 | `FLAG_SUBSCRIPTION` | 携带订阅表达式 | Broker 按表达式做服务端过滤（第 7.4 节） |
+| 0x8 | `FLAG_CLASS_FILTER` | 类过滤模式 | 走 FilterServer 远程过滤链路 |
+| 0x10 | `FLAG_LITE_PULL_MESSAGE` | Lite Pull Consumer（轻量拉模式） | 语义差异标识 |
+
+设计意图与消息的 `MessageSysFlag` 一致：**用 4 个 bit 替代 4 个独立字段**，序列化紧凑、判断 O(1)。
 
 ```mermaid
 flowchart TD
@@ -656,6 +676,20 @@ sequenceDiagram
     Note over CT,B: 崩溃恢复语义：<br>重启后从 Broker 读回 103<br>offset 103 会被重新投递<br>=> 至少一次投递, 业务需幂等
 ```
 
+### 6.6 广播模式补充：LocalFileOffsetStore
+
+（`client/.../consumer/store/LocalFileOffsetStore.java`）与远程版接口完全一致（`OffsetStore` 接口的两个实现），差异只在持久化目标：
+
+- **存储路径**：`$HOME/.rocketmq_offsets/{clientId}/offsets.json`（`:48-53`，`LOCAL_OFFSET_STORE_DIR`），按 clientId 隔离--同一台机器多个消费者实例互不覆盖；
+- **load()**：启动时从 json 反序列化 `OffsetSerializeWrapper`（topic@group -> {queueId: offset}）恢复内存表，失败则从 0 开始（`:91-111`）；
+- **persistAll**：复用 MQClientInstance 同一个 5s 定时任务，把内存表整体写回 json 文件（`:155-178`，先写 `offsets.json.tmp` 再原子 rename，防写坏）；
+- **readOffset 的 READ_FROM_STORE**：直接重读本地文件（`:136-147`），没有 RPC；
+- **updateOffset(mq, offset, increaseOnly)**：`increaseOnly=true` 时只允许进度前进（`:120-131`）--防止乱序回调把进度回拨。
+
+**为什么广播模式没有"捎带提交"**：进度文件在本地，拉取请求不需要也不应该把 offset 交给 Broker；`PullAPIWrapper` 在广播模式下会清除 commitOffset 标志（与 slave 拉取相同处理，`:167-169`）。
+
+> 广播模式的崩溃恢复语义比集群更弱：本地 json 是 5s 周期写的，崩溃最多丢 5s 内的进度（**消息会被重复消费**）；但消息不会丢--除非消息本身超过保留期被 Broker 删除，此时重启会从 minOffset 之前开始，触发 `OFFSET_ILLEGAL` 纠正（FAQ Q8）。
+
 ---
 
 ## 7. 如何定位到消息：Broker 端 getMessage
@@ -727,6 +761,220 @@ public SelectMappedBufferResult getIndexBuffer(final long startIndex) {
 3. **`suggestPullingFromSlave`**（`:697-700`）：若该组消费落后 CommitLog 最大偏移超过物理内存的一定比例（`accessMessageInMemoryMaxRatio`，默认40%），响应头建议**下次从从节点拉取**——消费太慢读脏了主节点页缓存时自动卸载到 slave。
 4. **nextBeginOffset 语义**：`offset + 实际扫描过的条目数`（含被过滤掉的），所以客户端 offset 天然跳过不匹配消息，进度不会卡死。
 
+### 7.4 消息过滤全流程与原理（深入）
+
+上面流程图里 `isMatchedByConsumeQueue` / `isMatchedByCommitLog` 两个判断点，就是 RocketMQ 消息过滤的核心。整体采用**三层过滤架构**：ConsumeQueue 快速粗筛（Broker） -> CommitLog 精确求值（Broker，仅 SQL92） -> 客户端兜底过滤。
+
+#### 7.4.1 订阅数据模型：SubscriptionData
+
+**文件**：`common/src/main/java/org/apache/rocketmq/common/protocol/heartbeat/SubscriptionData.java`
+
+| 字段 | 说明 |
+|---|---|
+| `topic` / `subString` | 订阅的 topic 与原始表达式（如 `"TagA || TagB"` 或 SQL92 语句） |
+| `tagsSet` | TAG 表达式解析出的 tag 字符串集合 |
+| `codeSet` | **预先算好的** tagsCode（`Arrays.hashCode(tag)`）集合，拉取时 O(1) 比对 |
+| `expressionType` | `TAG`（默认）/ `SQL92` |
+| `subVersion` | 订阅版本号（时间戳），broker 校验订阅一致性用 |
+| `classFilterMode` / `filterClassSource` | 类过滤模式（走 FilterServer，较少用） |
+
+客户端 `subscribe()` 时解析表达式填充 `tagsSet/codeSet`，订阅数据随心跳上报 broker，也随每次 Pull 请求头带上（`PullAPIWrapper` `:191-193`：`subscription` / `subVersion` / `expressionType`）。
+
+#### 7.4.2 过滤器构建：PullMessageProcessor
+
+**文件**：`broker/src/main/java/org/apache/rocketmq/broker/processor/PullMessageProcessor.java`
+
+1. **订阅关系校验**：优先用请求头里的表达式重建 subscriptionData；同时与 ConsumerManager 里注册的订阅比对 `subVersion`，防止组内订阅不一致（不一致返回 `SUBSCRIPTION_NOT_LATEST`）。
+2. **SQL92 过滤数据校验**：从 `ConsumerFilterManager` 按 `topic@group` 取 `ConsumerFilterData`，校验版本（`ConsumerFilterData` 在 subscribe 时注册并编译好表达式存在 broker）。
+3. **构建 MessageFilter 实例**（`:230-237`）：
+
+```java
+MessageFilter messageFilter;
+if (this.brokerController.getBrokerConfig().isFilterSupportRetry()) {
+    messageFilter = new ExpressionForRetryMessageFilter(subscriptionData, consumerFilterData,
+        this.brokerController.getConsumerFilterManager());
+} else {
+    messageFilter = new ExpressionMessageFilter(subscriptionData, consumerFilterData,
+        this.brokerController.getConsumerFilterManager());
+}
+```
+
+过滤器实现 `MessageFilter` 接口（`common/.../filter/MessageFilter.java`）：
+
+```java
+public interface MessageFilter {
+    boolean match(final MessageExt msg, final FilterContext context);                    // 通用匹配
+    boolean isMatchedByConsumeQueue(Long tagsCode, ConsumeQueueExt.CqExtUnit cqExtUnit); // 第一级: 基于索引条目
+    boolean isMatchedByCommitLog(ByteBuffer msgBuffer, Map<String, String> properties);  // 第二级: 基于消息属性
+}
+```
+
+两级接口的设计意图：**能用 20 字节索引条目（或扩展文件里的 bitMap）判断的绝不回查 commit log**，把 IO 和反序列化成本压到最低。
+
+#### 7.4.3 TAG 过滤原理：tagsCode 哈希比对
+
+**tagsCode 的来源**：消息写入时（`MessageExtBrokerInner.tagsString2tagsCode`）：
+
+```java
+public static long tagsString2tagsCode(final TopicFilterType type, final String tags) {
+    if (null == tags || tags.length() == 0) {
+        return 0;   // 无 tag 时 tagsCode = 0
+    }
+    return Arrays.hashCode(tags.split(","));
+}
+```
+
+它被 reput 线程写进 ConsumeQueue 条目的第 3 个 8 字节（见 7.1 的存储布局）。
+
+**匹配逻辑**（`broker/filter/ExpressionMessageFilter.isMatchedByConsumeQueue` `:71-82`）：
+
+```java
+if (ExpressionType.isTagType(subscriptionData.getExpressionType())) {
+    if (tagsCode == null) {
+        return true;                                              // 无 tagsCode, 不过滤
+    }
+    if (subscriptionData.getSubString().equals(SubscriptionData.SUB_ALL)) {
+        return true;                                              // 表达式为 "*", 全通过
+    }
+    return subscriptionData.getCodeSet().contains(tagsCode.intValue()); // 哈希集合 O(1) 比对
+}
+```
+
+要点：
+- **纯内存哈希比对，零额外 IO**：订阅时 tag 已预计算成 `codeSet`，消费队列里存的是消息 tag 的 hash，两者一个 `contains` 即完成过滤；
+- `tagsCode == 0`（消息无 tag）或订阅为 `*` 时直接放行；
+- **hash 碰撞风险**：tagsCode 是 int 哈希，可能碰撞误放行--这就是客户端还要做一道**字符串精确比对**兜底的原因（见 7.4.6）；
+- TAG 过滤**不需要** `isMatchedByCommitLog`，一次粗筛即定论。
+
+#### 7.4.4 SQL92 过滤原理：布隆过滤器 bitMap + 表达式求值
+
+SQL92（`MessageSelector.bySql("a between 0 and 3")`）支持对消息 properties 做类 SQL 条件过滤，代价是**必须读到消息属性才能判断**。RocketMQ 用布隆过滤器把大部分判断提前到了索引层。
+
+**核心组件：**
+
+| 组件 | 文件 | 职责 |
+|---|---|---|
+| `ConsumerFilterManager` | `broker/filter/ConsumerFilterManager.java` | 按 `topic@group` 注册/持久化 SQL92 过滤数据，维护全局布隆过滤器 |
+| `ConsumerFilterData` | `broker/filter/ConsumerFilterData.java` | 单组过滤配置：表达式原文、编译结果、bloom 数据、版本 |
+| `BloomFilter` | `filter/src/main/java/org/apache/rocketmq/filter/util/BloomFilter.java` | 误判率默认 20%（`maxErrorRateOfBloomFilter`）、期望订阅数 64（`expectConsumerNumUseFilter`），算出 bit 数与哈希函数个数（`bitMapLengthConsumeQueueExt=64` 位） |
+| `CommitLogDispatcherCalcBitMap` | `broker/filter/CommitLogDispatcherCalcBitMap.java` | reput 分发时的第三个 dispatcher：消息写入后为每个 SQL92 订阅者预计算 bitMap |
+| `ExpressionMessageFilter` | `broker/filter/ExpressionMessageFilter.java` | 两级匹配实现 |
+| `FilterFactory` / `SqlFilter` | `filter/` 模块 | SQL92 词法分析、`PolishExpr` 逆波兰式编译求值 |
+
+**两阶段流程：**
+
+**阶段一（写入时预计算）**--`CommitLogDispatcherCalcBitMap.dispatch`：
+
+```mermaid
+flowchart LR
+    A[ReputMessageService 分发消息] --> B[CalcBitMap.dispatch]
+    B --> C["遍历 ConsumerFilterManager<br/>中该 topic 的所有 SQL92 订阅"]
+    C --> D["用消息 properties 编译求值<br/>TRUE / FALSE"]
+    D --> E["对每个订阅者:<br/>BloomFilter.calcBitMap(consumerFilterData, msgKeys?)<br/>按求值结果置位生成 bitMap"]
+    E --> F["bitMap 写入 ConsumeQueueExt<br/>(cqExtUnit.bitMap)"]
+```
+
+即：**消息落盘时就把"哪些 SQL92 订阅者可能要它"算成了 64 位 bitMap**，与扩展文件里的存储时间、真实 tag hash 一起，通过主条目第 3 个 8 字节的**负数编码地址**（`address + Long.MIN_VALUE`）关联。
+
+**阶段二（拉取时两步过滤）**：
+
+```mermaid
+flowchart TD
+    A["遍历 ConsumeQueue 条目<br/>(DefaultMessageStore.getMessage :626-662)"] --> B{"tagsCode < 0?<br/>(是 ConsumeQueueExt 地址)"}
+    B -- "是" --> C["读出 CqExtUnit<br/>:643-653 (含 bitMap)"]
+    B -- "否(普通tag)" --> D["tagsCode 传给 isMatchedByConsumeQueue"]
+    C --> D
+    D --> E{"TAG 模式?<br/>codeSet.contains(tagsCode)"}
+    E -- "SQL92 模式" --> F["BloomFilter.isBitMapContain(cqExtUnit.bitMap)<br/>该组 bloom 位是否命中?"]
+    F -- "未命中" --> G["跳过, 不回查 CommitLog"]
+    F -- "命中(可能匹配)" --> H["isMatchedByCommitLog<br/>:674-682"]
+    E -- "TAG 且命中" --> I["直接加入结果"]
+    H --> J["从 CommitLog 取出消息字节<br/>解析 properties"]
+    J --> K["compiledExpression.evaluate(context)<br/>SQL92 精确求值"]
+    K -- "true" --> I
+    K -- "false/异常" --> G
+    G --> A
+    I --> A
+```
+
+布隆过滤器在这里的作用：**"未命中 = 一定不匹配"**，直接在索引层排除；"命中"只是可能匹配（有 ~20% 误判率），必须回查 commit log 精确求值。这样绝大多数不匹配消息不需要随机读 commit log。
+
+#### 7.4.5 过滤全链路时序图
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Consumer
+    participant PMP as PullMessageProcessor
+    participant CFM as ConsumerFilterManager
+    participant DMS as DefaultMessageStore.getMessage
+    participant CL as CommitLog
+    participant PW as PullAPIWrapper
+
+    Note over C: subscribe("T", "TagA || bySql(a>3)")
+    C->>PMP: PullRequest(subscription, subVersion, expressionType)
+    PMP->>PMP: 订阅一致性/版本校验
+    PMP->>CFM: 取 ConsumerFilterData(SQL92)
+    PMP->>PMP: 构建 ExpressionMessageFilter
+    PMP->>DMS: getMessage(group, topic, queueId, offset, filter)
+    loop 遍历 ConsumeQueue 条目
+        DMS->>DMS: 读 tagsCode(或 ext bitMap)
+        DMS->>DMS: isMatchedByConsumeQueue
+        alt SQL92 且 bloom 命中
+            DMS->>CL: getMessage(offsetPy, sizePy)
+            DMS->>DMS: isMatchedByCommitLog(properties 求值)
+        end
+    end
+    DMS-->>PMP: GetMessageResult + nextBeginOffset(含被过滤条目)
+    PMP-->>C: PullResult(FOUND / NO_MATCHED_MSG)
+    C->>PW: processPullResult
+    PW->>PW: 客户端 tag 字符串精确兜底过滤(:80-90)
+    PW-->>C: msgListFilterAgain 上抛消费
+```
+
+#### 7.4.6 客户端兜底过滤
+
+`PullAPIWrapper.processPullResult`（`client/.../consumer/PullAPIWrapper.java:80-90`）：
+
+```java
+if (!subscriptionData.getTagsSet().isEmpty() && !subscriptionData.isClassFilterMode()) {
+    msgListFilterAgain = new ArrayList<>(msgList.size());
+    for (MessageExt msg : msgList) {
+        if (msg.getTags() != null
+            && subscriptionData.getTagsSet().contains(msg.getTags())) {   // 字符串精确比对
+            msgListFilterAgain.add(msg);
+        }
+    }
+}
+```
+
+它解决两个问题：
+1. **tagsCode 哈希碰撞**导致的误放行（broker 按 int hash 判定，客户端按原字符串再判一次）；
+2. broker 端过滤数据缺失/降级场景（如订阅刚变更、表达式尚未生效）。
+
+注意：客户端兜底**只对 TAG 有效**，SQL92 不在客户端重复求值（broker 已精确求值过）。
+
+#### 7.4.7 特殊场景与配置
+
+1. **无 tag 消息**：`tagsCode = 0`，TAG 订阅者中只有订阅 `*` 的能收到它（`codeSet` 里不会有 0，除非表达式恰好包含无 tag 消息）。
+2. **订阅表达式为 `*` 或 null**：全放行，不做任何过滤。
+3. **类过滤模式**（`classFilterMode`）：表达式为 Java 类源码，部署到 FilterServer 进程远程执行（`filterServerNums > 0` 时启用），`isMatchedByConsumeQueue` 直接返回 true，较少使用。
+4. **相关配置**：
+
+| 配置 | 默认值 | 说明 |
+|---|---|---|
+| `enablePropertyFilter` | false | broker 开启 SQL92 过滤功能 |
+| `enableConsumeQueueExt` | false | 启用 CQ 扩展文件（SQL92 bitMap 的载体，开启 SQL92 时必须） |
+| `maxErrorRateOfBloomFilter` | 20 | 布隆误判率（%） |
+| `expectConsumerNumUseFilter` | 64 | 布隆期望订阅数，超过会扩大 bitMap |
+| `bitMapLengthConsumeQueueExt` | 64 | bitMap 位长 |
+| `filterServerNums` | 0 | FilterServer 数量（类过滤） |
+
+5. **性能结论**：
+   - TAG 过滤：O(1) 哈希比对，**只扫索引不额外 IO**，被过滤消息的成本仅是"读 20 字节条目后丢弃"；
+   - SQL92 过滤：写入侧多一次表达式预计算（每订阅者），读取侧 bloom 未命中的消息同样零 commit log IO；只有 bloom 命中才付一次随机读 + 求值；
+   - 两种模式下 `nextBeginOffset` 都按**扫描过的条目数**推进，被过滤的消息不会阻塞消费进度。
+
 ---
 
 ## 8. 消息分发与消费：ProcessQueue 与 ConsumeMessageService
@@ -739,11 +987,240 @@ this.consumeMessageService.submitConsumeRequest(                                
     msgFoundList, processQueue, messageQueue, dispatchToConsume);
 ```
 
-- `ProcessQueue.putMessage()`（`ProcessQueue.java:133-`）：按 queueOffset 为 key 放入 `TreeMap<Long, MessageExt> msgTreeMap`（保证 offset 有序，才能 O(1) 取 firstKey 做进度）；返回值表示是否需要立即分发（树的旧值未清理时会延迟）。
-- `ConsumeMessageConcurrentlyService.submitConsumeRequest()`（`ConsumeMessageConcurrentlyService.java:115-`）：按 `consumeMessageBatchMaxSize`（默认 1，即一条一个任务）切分，逐个 `consumeExecutor.submit(new ConsumeRequest(...))`；线程池打满（RejectedExecutionException）时延迟 5s 重投（`submitConsumeRequestLater`）。
-- `ConsumeRequest.run()` 执行业务 listener -> `processConsumeResult` -> `removeMessage` -> `updateOffset`（见第 6 节）。
+拉取与消费**解耦于 ProcessQueue**：拉取线程往里放，消费线程从里取，进度取树的最小 key——这也是流控阈值（树的大小）能反映消费积压的原因。
 
-拉取与消费解耦于 `ProcessQueue`：**拉取线程往里放，消费线程从里取，进度取树的最小 key**——这也是流控阈值（树的大小）能反映消费积压的原因。
+### 8.1 ProcessQueue 设计解析
+
+**文件**：`client/.../impl/consumer/ProcessQueue.java`（类注释自述："Queue consumption snapshot"，队列的消费快照）。它是 MessageQueue 在客户端的**运行时投影**，核心字段：
+
+| 字段 | 类型 | 作用 | 源码 |
+|---|---|---|---|
+| `msgTreeMap` | `TreeMap<Long, MessageExt>` | **核心数据结构**：queueOffset -> 消息，TreeMap 保证 offset 有序，firstKey 即消费进度 | `:50` |
+| `treeMapLock` | `ReentrantReadWriteLock` | 保护 msgTreeMap，读写锁隔离拉取/消费并发 | `:49` |
+| `consumingMsgOrderlyTreeMap` | `TreeMap<Long, MessageExt>` | **顺序消费专用**：msgTreeMap 的子集，"已取出正在消费但未提交"的消息 | `:57` |
+| `msgCount` / `msgSize` | `AtomicLong` | 缓存条数/字节数，供流控（4.2 的闸门1/2）O(1) 读取 | `:51-52` |
+| `consumeLock` | `ReentrantLock` | **顺序消费时消费线程与 rebalance 删除线程的互斥锁**（见 8.8） | `:53` |
+| `dropped` | `volatile boolean` | ⭐生命周期标志：rebalance 剥夺队列后置 true，拉取/消费线程见到即放弃该队列 | `:60` |
+| `locked` / `lastLockTimestamp` | `volatile` | 顺序消费的 broker 锁状态与加锁时间（`REBALANCE_LOCK_MAX_LIVE_TIME` 默认 30s 过期，`:44-45`） | `:63-64` |
+| `lastPullTimestamp` | `volatile long` | 长期（`PULL_MAX_IDLE_TIME` 默认 120s，`:47`）无拉取活动则被 rebalance 剔除自愈 | `:61` |
+| `consuming` | `volatile boolean` | 顺序消费的"树上是否还有待消费消息"标志，控制 `putMessage` 返回值 | `:65` |
+| `msgAccCnt` | `volatile long` | 由最后一条消息的 `PROPERTY_MAX_OFFSET - queueOffset` 算出的**该队列总积压量**（监控用） | `:66` |
+
+**为什么用 TreeMap 而不是 HashMap/LinkedList**：三个需求同时满足——① 按 queueOffset 天然排序，`firstKey()` O(logN) 取"下一条待消费位置"（进度语义）；② `lastKey() - firstKey()` 即 `getMaxSpan()`（`:174-189`），支撑跨度流控；③ 顺序消费按序取出（`pollFirstEntry`）。
+
+### 8.2 putMessage / removeMessage：进与出
+
+**放入（`putMessage`，`:133-172`）**：
+
+```java
+for (MessageExt msg : msgs) {
+    MessageExt old = msgTreeMap.put(msg.getQueueOffset(), msg);   // key 是 queueOffset!
+    if (null == old) {                       // 重复 offset 不重复计数
+        validMsgCnt++;
+        this.queueOffsetMax = msg.getQueueOffset();
+        msgSize.addAndGet(msg.getBody().length);
+    }
+}
+...
+if (!msgTreeMap.isEmpty() && !this.consuming) {   // :149-152
+    dispatchToConsume = true;                     // 树从空变为有货 -> 需要触发消费
+    this.consuming = true;
+}
+```
+
+- key 是 **queueOffset**（不是 msgId）：同一队列的 offset 全局唯一，天然幂等（重复拉取不会重复计数）。
+- `dispatchToConsume` 的语义：**"这批消息让树从空变为非空，需要启动消费"**。
+  - 并发消费（8.4）**忽略**该值：每批消息无条件提交线程池；
+  - 顺序消费（8.8）**依赖**该值：只有 true 才提交 ConsumeRequest，保证同一队列任意时刻只有一个消费任务在跑（任务内部循环 `takeMessages` 直到取空，取空时 `consuming` 复位 false，`:329-331`，下批消息到来才会再次触发新任务）。
+- 末尾解析消息属性 `PROPERTY_MAX_OFFSET`（broker 在响应里捎带的队列最大 offset）计算 `msgAccCnt` 总积压（`:154-163`）。
+
+**移除（`removeMessage`，`:191-224`）**：
+
+```java
+if (!msgTreeMap.isEmpty()) {
+    result = this.queueOffsetMax + 1;          // 先按"全部消费完"给个默认值
+    for (MessageExt msg : msgs) {
+        MessageExt prev = msgTreeMap.remove(msg.getQueueOffset());  // 物理删除
+        if (prev != null) { removedCnt--; msgSize.addAndGet(-msg.getBody().length); }
+    }
+    if (msgCount.addAndGet(removedCnt) == 0) { msgSize.set(0); }   // 清零修正
+    if (!msgTreeMap.isEmpty()) {
+        result = msgTreeMap.firstKey();        // ⭐树不空: 进度 = 第一条未消费消息的 offset
+    }
+}
+```
+
+**进度语义再强调**：返回值是"树中最小剩余 offset"（下一条待消费位置）。消费失败但 sendMessageBack 成功的消息也从树里删掉——失败消息换到 `%RETRY%` topic 重试，**不阻塞主队列进度**；只有回发失败的消息留在树上（8.5）。
+
+### 8.3 submitConsumeRequest：任务切分与线程池
+
+**文件**：`client/.../impl/consumer/ConsumeMessageConcurrentlyService.java:191-228`
+
+```java
+final int consumeBatchSize = this.defaultMQPushConsumer.getConsumeMessageBatchMaxSize();  // 默认1
+if (msgs.size() <= consumeBatchSize) {
+    this.consumeExecutor.submit(new ConsumeRequest(msgs, processQueue, messageQueue));
+} else {
+    // 按 consumeBatchSize 切成多批, 逐批 submit
+}
+```
+
+- 消费线程池（`:79-85`）：`ThreadPoolExecutor(consumeThreadMin, consumeThreadMax, 60s, LinkedBlockingQueue)`，默认 20/20，线程名 `ConsumeMessageThread_{group}_`（group 超过 100 字符截断）。
+- **拒绝兜底**：抛 `RejectedExecutionException` 时 `submitConsumeRequestLater` 延迟 5s 重投（`:323-348`）——消息还在 ProcessQueue 树里，延迟重投不会丢。
+- 批量消费：`consumeMessageBatchMaxSize > 1` 时一次 listener 回调收到多条消息（配合 `ConsumeConcurrentlyContext.setAckIndex` 可声明部分成功）。
+
+### 8.4 ConsumeRequest.run：消费执行全流程
+
+（`ConsumeMessageConcurrentlyService.java:369-453`）在消费线程池里执行：
+
+```mermaid
+flowchart TD
+    A["ConsumeRequest.run"] --> B{"processQueue.isDropped()?"}
+    B -- "是(队列已被rebalance剥夺)" --> Z["直接return<br>消息留在树上等接管方<br>:371-374"]
+    B -- 否 --> C["resetRetryAndNamespace:<br>%RETRY%topic 还原为原topic<br>(重试消息伪装成原消息给业务)<br>:379"]
+    C --> D["逐条 setConsumeStartTimeStamp<br>:397-401 (供cleanExpiredMsg用)"]
+    D --> E["executeHookBefore 消费钩子<br>:382-391"]
+    E --> F["listener.consumeMessage(msgs, context)<br>调用业务代码, 捕获一切Throwable<br>:402-410"]
+    F --> G{"status == null?"}
+    G -- "是(抛异常或返回null)" --> H["status = RECONSUME_LATER<br>:430-436"]
+    G -- 否 --> I["统计 returnType:<br>EXCEPTION/RETURNNULL/TIME_OUT/FAILED/SUCCESS<br>:411-424"]
+    H --> J["executeHookAfter + RT统计<br>:438-446"]
+    I --> J
+    J --> K{"processQueue.isDropped()?"}
+    K -- 是 --> Y["只打日志, 不处理结果<br>:450-452 (进度交给接管方)"]
+    K -- 否 --> L["processConsumeResult(status, context, this)<br>:448-449"]
+```
+
+关键细节：
+
+1. **dropped 双重检查**（执行前 `:371`、处理结果前 `:448` 各一次）：rebalance 可能在消费过程中剥夺队列。消费完成后若发现 dropped，**不提交 offset 也不移除消息**——接管方会从 broker 记录的进度重新拉到这批消息（可能重复消费，见 FAQ Q3）。
+2. **业务异常不会打断消费框架**：listener 抛 Throwable 被捕获，status 置 `RECONSUME_LATER` 走重试，框架本身不受影响。
+3. **超时统计**：`consumeRT >= consumeTimeout(15min) * 60 * 1000` 标记 `TIME_OUT`（`:418-419`，仅统计分类不干预；真正的超时清理在 8.7）。
+
+### 8.5 processConsumeResult：ACK 语义与失败转发
+
+（`ConsumeMessageConcurrentlyService.java:241-302`）
+
+**ackIndex 机制**（`ConsumeConcurrentlyContext.ackIndex` 默认 `Integer.MAX_VALUE`）：
+
+```java
+switch (status) {
+    case CONSUME_SUCCESS:
+        if (ackIndex >= msgs.size()) { ackIndex = msgs.size() - 1; }  // 批量: 默认全部成功
+        break;
+    case RECONSUME_LATER:
+        ackIndex = -1;                                                 // 全部失败
+        break;
+}
+// 业务可通过 context.setAckIndex(n) 声明"前 n+1 条成功"
+```
+
+**失败处理按消息模式分流（`:270-296`）**：
+
+| 模式 | `[ackIndex+1, size)` 范围内的失败消息 |
+|---|---|
+| BROADCASTING | **直接丢弃**，只打日志（广播没有共享进度与重试投递路径） |
+| CLUSTERING | 逐条 `sendMessageBack(msg, context)` 转入重试链路；回发失败的 `reconsumeTimes+1` 并 `msgBackFailed` 从本批移除，**留在 ProcessQueue 树里**，5s 后本地重投（`:288-292`） |
+
+**收尾（`:298-301`）**：
+
+```java
+long offset = consumeRequest.getProcessQueue().removeMessage(consumeRequest.getMsgs());
+if (offset >= 0 && !consumeRequest.getProcessQueue().isDropped()) {
+    this.defaultMQPushConsumerImpl.getOffsetStore().updateOffset(mq, offset, true);   // 只更新内存
+}
+```
+
+`removeMessage` 移除的是 `consumeRequest.getMsgs()` 中剩余的消息（回发失败的已被 `removeAll(msgBackFailed)` 移出），树中最终保留：回发失败待本地重投的消息 + 尚未消费的后续消息。
+
+### 8.6 sendMessageBack：重试与死信链路
+
+**并发模式**（`ConsumeMessageConcurrentlyService.sendMessageBack:308-321` -> `DefaultMQPushConsumerImpl.sendMessageBack:522-549`）：
+
+```java
+// 正常路径: RPC 到原消息所在的 broker
+this.mQClientFactory.getMQClientAPIImpl().consumerSendMessageBack(
+    brokerAddr, brokerName, msg, group, delayLevel, 5000, getMaxReconsumeTimes());   // :527-528
+```
+
+- `delayLevel` 来自 `context.getDelayLevelWhenNextConsume()`（业务可在失败时指定下次重试的延迟级别，`ConsumeConcurrentlyContext`）。
+- broker 端（`SendMessageProcessor` 的 `consumerSendMessageBack`）改写消息：topic -> `%RETRY%{group}`、原 topic 存入 `PROPERTY_RETRY_TOPIC`、`reconsumeTimes+1`、延迟级别 = `delayLevel + 3`（重试消息从 10s 档开始梯度重试）；**当 reconsumeTimes > maxReconsumeTimes 时直接进死信 `%DLQ%{group}`**。
+- **降级路径**（RPC 失败，`:532-545`）：客户端用**内置生产者**重新组装消息发到 `%RETRY%{group}`，`delayTimeLevel = 3 + reconsumeTimes`，properties 携带 `RETRY_TOPIC/RECONSUME_TIME/MAX_RECONSUME_TIMES`。
+- 最大重试次数：并发模式默认 **16 次**（`getMaxReconsumeTimes`，`DefaultMQPushConsumerImpl.java:551-558`，`-1` 表示取默认 16）。
+- 重试消息到达消费者后由 8.4 的 `resetRetryAndNamespace` 把 `%RETRY%` 还原成原 topic 再交给业务，业务代码对"重试"无感知（除 `msg.getReconsumeTimes()`）。
+
+### 8.7 cleanExpiredMsg：超时消息清理
+
+（`ConsumeMessageConcurrentlyService.start():91-104` 启动 `CleanExpireMsgScheduledThread_`，周期 = `consumeTimeout` 默认 15 分钟）：
+
+```java
+// ProcessQueue.cleanExpiredMsg, :79-131
+if (pushConsumer.getDefaultMQPushConsumerImpl().isConsumeOrderly()) {
+    return;                                   // 顺序消费不清理(不允许跳过)
+}
+int loop = msgTreeMap.size() < 16 ? msgTreeMap.size() : 16;   // 每轮最多16条
+// 只检查树的头结点(最小offset): 消费开始时间距 now > consumeTimeout 即视为卡死
+if (now - consumeStartTimeStamp > consumeTimeout * 60 * 1000) {
+    pushConsumer.sendMessageBack(msg, 3);     // 回发重试, delayLevel=3(10s档)
+    if (msg.getQueueOffset() == msgTreeMap.firstKey()) {
+        removeMessage(Collections.singletonList(msg));   // 确认仍是头结点才移除, 防并发误删
+    }
+}
+```
+
+**解决"毒消息/堆积卡死队列"**：头结点消息的消费开始时间（8.4 中设置的 `setConsumeStartTimeStamp`）超过 15 分钟即被移出主队列转重试。只从头结点检查保证不越过未处理消息造成乱序。
+
+### 8.8 顺序消费：ConsumeMessageOrderlyService
+
+**文件**：`client/.../impl/consumer/ConsumeMessageOrderlyService.java`。与并发模式的三个本质差异：
+
+**① 三层锁保序**：
+
+| 层 | 实现 | 保护什么 |
+|---|---|---|
+| broker 分布式锁 | rebalance 分到队列时 `lock(mq)`（LOCK_MQ RPC），`lockMQPeriodically` 每 20s（`REBALANCE_LOCK_INTERVAL`）续期；锁 30s（`REBALANCE_LOCK_MAX_LIVE_TIME`）不过期才可消费 | **同一队列同一时刻只属于一个消费者**（跨进程） |
+| 客户端队列锁 | `messageQueueLock.fetchLockObject(mq)` + `synchronized`（`ConsumeRequest.run:432-433`） | 同一客户端内该队列的 ConsumeRequest 串行 |
+| ProcessQueue.consumeLock | `processQueue.getConsumeLock().lock()` 包住 listener 调用（`:491-507`） | 消费进行中时阻止 rebalance 线程删除该队列（`removeUnnecessaryMessageQueue` 需先拿此锁，见 3.4） |
+
+**② 消费的"取出-提交"两阶段**（利用 `consumingMsgOrderlyTreeMap`）：
+
+```mermaid
+flowchart LR
+    A["msgTreeMap<br>(待消费)"] -->|"takeMessages(n) :310-340<br>pollFirstEntry 移到消费树"| B["consumingMsgOrderlyTreeMap<br>(消费中)"]
+    B -->|"commit():268-292<br>返回 lastKey+1, 推进offset"| C["已消费"]
+    B -->|"rollback():254-266<br>放回msgTreeMap"| A
+    B -->|"makeMessageToConsumeAgain :294-308<br>(SUSPEND本地重试)"| A
+```
+
+ConsumeRequest.run（`:426-`）在 `synchronized(objLock)` 内**循环** `takeMessages(batchSize)` -> listener -> `processConsumeResult`，直到树取空（下批消息 `putMessage` 时 `dispatchToConsume` 才会再次为 true）或单次任务连续消费超过 `MAX_TIME_CONSUME_CONTINUOUSLY`（默认 60s，强制让出线程防止单队列长期独占消费线程，`:457-461`）。
+
+**③ 失败处理是"本地挂起"而不是转重试 topic**：
+
+```java
+case SUSPEND_CURRENT_QUEUE_A_MOMENT:                      // :290-302
+    if (checkReconsumeTimes(msgs)) {                      // 未超最大重试次数(顺序模式默认Integer.MAX_VALUE)
+        consumeRequest.getProcessQueue().makeMessageToConsumeAgain(msgs);   // 放回待消费树
+        this.submitConsumeRequestLater(processQueue, mq,
+            context.getSuspendCurrentQueueTimeMillis());  // 默认1s后本地重试(10ms~30s钳制, :247-261)
+        continueConsume = false;
+    } else {
+        commitOffset = consumeRequest.getProcessQueue().commit();   // 超次数: 消息已sendMessageBack进DLQ, 当作消费成功
+    }
+```
+
+`checkReconsumeTimes`（`:358-375`）只有 `reconsumeTimes >= maxReconsumeTimes` 时才 `sendMessageBack` 进 DLQ（`:377-398`，`delayTimeLevel = 3 + reconsumeTimes`），否则一律本地挂起重试——**保证顺序的同时，失败消息会阻塞本队列**（顺序消费的固有代价）。
+
+**顺序/并发模式对比总结**：
+
+| 维度 | 并发 ConsumeMessageConcurrentlyService | 顺序 ConsumeMessageOrderlyService |
+|---|---|---|
+| 触发方式 | 每批消息无条件提交线程池 | 仅 `dispatchToConsume=true`（树从空到有）时提交，任务内循环消费到空 |
+| 同队列并发 | 多线程可同时消费同一队列 | 三层锁保证串行 |
+| 进度推进 | `removeMessage` -> firstKey | `commit()` -> 消费树 lastKey+1 |
+| 失败处理 | 立即 sendMessageBack 转 `%RETRY%`，主队列继续 | 本地挂起（放回树 + 延迟重投），阻塞队列 |
+| 消息顺序 | 不保证 | 队列内严格有序 |
+| 超时清理 | cleanExpiredMsg 15min 转重试 | 不清理 |
+| 最大重试 | 默认 16 次后进 DLQ | 默认 Integer.MAX_VALUE（近乎无限本地重试） |
 
 ---
 
@@ -873,6 +1350,18 @@ PullRequest 拉取完成（成功/失败/超时）后才重新入队发起下一
 **Q8：`OFFSET_ILLEGAL` 是怎么造成的？**
 典型原因：Broker 数据文件过期删除导致 minOffset 前移（进度比 minOffset 小）、或 offset 大于 maxOffset（进度文件损坏/手工修改）。处理是硬纠正：客户端丢弃本地 ProcessQueue，10s 后用 Broker 纠正的 `nextBeginOffset` 重建队列（`DefaultMQPushConsumerImpl.java:368-392`）——**可能跳过或重复一部分消息**，日志关键字 `fix the pull request offset`。
 
+**Q9：消费失败后的完整重试链路？**
+并发模式：listener 返回 `RECONSUME_LATER` -> `processConsumeResult` 把失败消息 `sendMessageBack` -> Broker 改写为 `%RETRY%{group}` 新消息（原 topic 存 `PROPERTY_RETRY_TOPIC`，reconsumeTimes+1，延迟级别 = delayLevel+3 即 10s 起步）-> 延迟到期后重新投递 -> 客户端 `resetRetryAndNamespace` 还原原 topic 给业务。重试 16 次（默认）后进 `%DLQ%{group}` 死信。**回发失败的消息留在 ProcessQueue 5s 后本地重投**，不是丢弃（见 8.5/8.6）。
+
+**Q10：ProcessQueue 的 `dropped=true` 之后，树里没消费的消息去哪了？**
+不丢。dropped 只是本消费者的"放弃声明"：本地树被丢弃、offset 不再提交，但 Broker 端记录的进度还停留在最后一次成功提交的位置--rebalance 把队列分给新消费者后，新消费者从该进度重新拉取这批消息。代价是间隔内已消费未提交的部分会重复消费（at-least-once）。
+
+**Q11：为什么顺序消费失败会"卡住"队列，并发模式不会？**
+顺序模式的 `SUSPEND_CURRENT_QUEUE_A_MOMENT` 处理是 `makeMessageToConsumeAgain` 放回待消费树 + 1s 后本地重投（`ConsumeMessageOrderlyService.java:290-302`），消息不离开队列，天然阻塞后续消息（保序的必然代价）；并发模式失败消息立即转 `%RETRY%` topic，主队列进度照常推进。所以顺序消费务必配置合理的 `maxReconsumeTimes` 并监控消费延迟，避免毒消息把队列挂死。
+
+**Q12：`consumeTimeout`（15 分钟）到底管什么？**
+它不是"消费超时中断"（框架不会打断 listener），只做两件事：① 统计上把超过它的消费标记为 `TIME_OUT`（`ConsumeMessageConcurrentlyService.java:418-419`）；② 驱动 `cleanExpiredMsg` 定时清理（8.7）--树的头结点消息从**开始消费**算起超过该时长且一直没被移除（典型：ConsumeRequest 堆积在线程池队列里迟迟没执行），就被转重试并从树里删掉，防止进度卡死。
+
 ---
 
 ## 附：涉及的关键源码文件索引
@@ -887,6 +1376,10 @@ PullRequest 拉取完成（成功/失败/超时）后才重新入队发起下一
 | `client/.../impl/consumer/DefaultMQPushConsumerImpl.java` | pullMessage（流控/回调循环）、启动流程 |
 | `client/.../impl/consumer/PullAPIWrapper.java` | 组装请求、选择主从、tag 兜底过滤 |
 | `client/.../impl/consumer/ProcessQueue.java` | 本地消息树（msgTreeMap）、进度来源 |
+| `client/.../impl/consumer/ConsumeMessageConcurrentlyService.java` | 并发消费：任务切分、消费执行、ACK/失败转发、超时清理 |
+| `client/.../impl/consumer/ConsumeMessageOrderlyService.java` | 顺序消费：三层锁、取出-提交两阶段、本地挂起重试 |
+| `client/.../impl/consumer/MessageQueueLock.java` | 顺序消费的客户端队列锁（fetchLockObject） |
+| `common/.../sysflag/PullSysFlag.java` | 拉取请求 sysFlag 位定义（commitOffset/suspend/subscription...） |
 | `client/.../impl/MQClientAPIImpl.java` | PULL_MESSAGE 异步 RPC、响应码->PullStatus |
 | `client/.../consumer/store/RemoteBrokerOffsetStore.java` | 集群模式进度：内存表 + 持久化到 Broker |
 | `client/.../consumer/store/LocalFileOffsetStore.java` | 广播模式进度：本地 json 文件 |
