@@ -42,7 +42,7 @@ flowchart TB
         HC2 --> RS2["ReadSocketService"]
         HC2 --> WS2["WriteSocketService"]
         WS1 -. "selectMappedBuffer 零拷贝读" .- CL_M
-        WS2 -. .- CL_M
+        WS2 -. "零拷贝读" .-> CL_M
         RS1 -- "notifyTransferSome" --> HS
         HS -- "push2SlaveMaxOffset(CAS推进)" --> GT
         CL_M --> REPUT_M
