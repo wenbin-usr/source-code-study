@@ -10,7 +10,7 @@
 ## 目录
 
 1. [背景：4.x 延迟级别 vs 5.x 任意时间](#1-背景4x-延迟级别-vs-5x-任意时间)
-2. [总体架构](#2-总体架构)
+2. [总体架构](#2-总体架构)（含 2.1 TimerMessageStore 的七类后台线程）
 3. [客户端：延迟时间的表达](#3-客户端延迟时间的表达)
 4. [Broker 入口：消息变换（transformTimerMessage）](#4-broker-入口消息变换transformtimermessage)
 5. [存储层三大数据结构](#5-存储层三大数据结构)
@@ -95,6 +95,47 @@ flowchart TB
 
 - **第一次写入**：真实 Topic 被改写为 `rmq_sys_wheel_timer`，消息体原样进 CommitLog（消费者看不见它，因为没人订阅系统 Topic）。
 - **第二次写入**：到点后从 CommitLog 读出消息，还原真实 Topic/QueueId，**再写一次 CommitLog**——此时才是普通消息，消费者可见。原始消息和索引由后台清理。
+
+### 2.1 TimerMessageStore 的七类后台线程
+
+全部在 `initService()`（TimerMessageStore.java:242-260）中创建，`start()`（495-549）按"入队→预热→出队→刷盘"顺序启动。它们通过三个有界队列（`enqueuePutQueue` / `dequeueGetQueue` / `dequeuePutQueue`，容量 1024，可换 Disruptor）串联成一条流水线：
+
+```mermaid
+flowchart LR
+    subgraph 入队["入队阶段"]
+        EGS["① TimerEnqueueGetService ×1<br/>扫描ConsumeQueue"]
+        EPS["② TimerEnqueuePutService ×1<br/>写TimerLog+时间轮"]
+        EGS -->|"enqueuePutQueue"| EPS
+    end
+    subgraph 出队["出队阶段"]
+        DGS["③ TimerDequeueGetService ×1<br/>推进读指针,收集到点请求"]
+        DWS["④ TimerDequeueWarmService ×1<br/>预热页缓存(当前禁用)"]
+        DGMS["⑤ TimerDequeueGetMessageService ×N<br/>回读CommitLog取消息体"]
+        DPMS["⑥ TimerDequeuePutMessageService ×N<br/>还原真实Topic写回CommitLog"]
+        DGS -->|"dequeueGetQueue"| DGMS
+        DGMS -->|"dequeuePutQueue"| DPMS
+        DWS -.-> DGS
+    end
+    TFS["⑦ TimerFlushService ×1<br/>刷盘+checkpoint+快照"]
+    EPS -.-> TFS
+    DPMS -.-> TFS
+```
+
+| # | 线程（类） | 实例数 | 作用 |
+|---|---|---|---|
+| ① | `TimerEnqueueGetService` | 1 | **入队扫描**：循环调用 `enqueue(0)`，从 `rmq_sys_wheel_timer` 的 ConsumeQueue 自 `currQueueOffset` 起迭代，回读 CommitLog 取出 `TIMER_OUT_MS`，构造 `TimerRequest` 塞入 `enqueuePutQueue`（offer 3 秒超时自旋，队满即天然背压）。空轮 `waitForRunning(100 * precisionMs / 1000)`。 |
+| ② | `TimerEnqueuePutService` | 1 | **入队落轮**：从 `enqueuePutQueue` 攒批（最多 11 条），逐条 `putMessageToTimerWheel` → `doEnqueue`（写 52B TimerLog 记录 + putSlot 更新时间轮）。已到点的请求直接旁路进 `dequeuePutQueue`；整批全部 `idempotentRelease` 成功才推进 `commitQueueOffset` 并 `maybeMoveWriteTime()`，失败整批重试——保证"索引落盘先于位点提交"。 |
+| ③ | `TimerDequeueGetService` | 1 | **出队总指挥**：循环调用 `dequeue()`。校验 `currReadTimeMs < currWriteTimeMs` 且本机为 master（`isRunningDequeue`），取 `getSlot(currReadTimeMs)`，沿 `prev pos` 链回溯 TimerLog 解出全部记录，分成墓碑/普通两个栈；先投墓碑列表、再投普通列表到 `dequeueGetQueue`（`splitIntoLists` 按 CommitLog 文件分组），`checkDequeueLatch` 等本槽全部处理完才 `moveReadTime()` 推进读指针——**槽粒度提交，主从切换时置 `dequeueStatusChangeFlag` 防丢**。 |
+| ④ | `TimerDequeueWarmService` | 1 | **预热**：`warmDequeue()` 预读未来 2 个精度槽的 TimerLog 与 CommitLog 页（每 4KB 触碰一次 `bf.get()`），把页提前加载进 OS page cache，降低 ⑤ 的回读延迟。**注意 5.4.0 中该服务的主逻辑被注释掉了**（run 方法里 `waitForRunning(50)` 空转），仅保留骨架，相当于预留的优化开关。 |
+| ⑤ | `TimerDequeueGetMessageService` | N（`timerGetMessageThreadNum`，默认 3） | **出队回读**（IO 密集）：从 `dequeueGetQueue` 取请求列表，按 `offsetPy/sizePy` 回读 CommitLog 取出完整消息体；同时处理撤回语义——墓碑消息把 `TIMER_DEL_UNIQKEY` 收集进 `deleteList`，普通消息 uniqKey 命中 `deleteList` 则丢弃（被撤回），否则 `offer` 进 `dequeuePutQueue`（3 秒超时自旋）。`AbstractStateService` 状态机（WAITING/RUNNING）供 ③ 的 latch 检查判断卡死。 |
+| ⑥ | `TimerDequeuePutMessageService` | N（`timerPutMessageThreadNum`，默认 2） | **出队写回**：从 `dequeuePutQueue` 取带消息体的请求，`convert()` 补 `TIMER_ENQUEUE_MS/TIMER_DEQUEUE_MS` 属性，`convertMessage()` **还原真实 Topic/QueueId**（needRoll=true 则保持 wheel_timer 触发再滚一轮），`doPut()` 写回 CommitLog。PUT_NEED_RETRY 睡 500ms 重试（默认 3 次上限，`timerEnableRetryUntilSuccess=true` 则无限重试），PUT_NO_RETRY 丢弃告警。 |
+| ⑦ | `TimerFlushService` | 1 | **持久化**：周期（默认 10s）执行 `timerLog flush` + `timerWheel.flush()`（diff 写回 mmap 并 force）+ `prepareTimerCheckPoint()`（持久化三个位点）+ 可选 `timerWheel.backup()` 快照（5.4.0 新增，加速重启恢复）。崩溃恢复的边界全部由此线程刻画。 |
+
+三个设计要点：
+
+1. **生产者-消费者流水线 + 天然背压**：三队全是有界队列，①~⑥ 之间无锁接力；任一环节变慢，压力前传，`enqueuePutQueue` 满则 ① 的 offer 自旋阻塞，进而使 `currQueueOffset` 停止推进——**入队积压可控、不丢消息**。
+2. **单线程写、多线程读**：时间轮/TimerLog 的写入只在 ② 一个线程发生（无锁）；CommitLog 回读是 IO 密集操作交给 ⑤ 的 3 个线程并行、写回交给 ⑥ 的 2 个线程并行——**按资源特征分配并发度**。
+3. **角色收敛于单点**：入队侧推进两个位点（`currQueueOffset`/`commitQueueOffset`），出队侧推进 `currReadTimeMs`，全部由单线程 ①③ 持有，主从切换语义（`shouldRunningDequeue`）只在 master 生效，避免双写冲突。
 
 ## 3. 客户端：延迟时间的表达
 
