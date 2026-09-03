@@ -13,11 +13,11 @@
 2. [总体架构](#2-总体架构)（含 2.1 TimerMessageStore 的七类后台线程）
 3. [客户端：延迟时间的表达](#3-客户端延迟时间的表达)
 4. [Broker 入口：消息变换（transformTimerMessage）](#4-broker-入口消息变换transformtimermessage)
-5. [存储层三大数据结构](#5-存储层三大数据结构)
+5. [存储层三大数据结构](#5-存储层三大数据结构)（含 5.5 TimerWheel 时间轮实现原理深度剖析与 Kafka/Netty 对比）
 6. [入队流程：从 CommitLog 到时间轮](#6-入队流程从-commitlog-到时间轮)
 7. [doEnqueue：写 TimerLog + 更新时间轮](#7-doenqueue写-timerlog--更新时间轮)
 8. [滚动机制（Roll）：超长延迟的降级处理](#8-滚动机制roll超长延迟的降级处理)
-9. [出队流程：到点投递](#9-出队流程到点投递)
+9. [出队流程：到点投递](#9-出队流程到点投递)（含 9.1 "到点"的感知原理：轮询指针而非定时器）
 10. [可靠性与恢复（Recover / Checkpoint）](#10-可靠性与恢复recover--checkpoint)
 11. [流控、精度与配置](#11-流控精度与配置)
 12. [端到端完整时序图](#12-端到端完整时序图)
@@ -231,6 +231,134 @@ flowchart LR
 
 记录三个恢复锚点：`lastTimerLogFlushPos`（TimerLog 刷盘位置）、`lastTimerQueueOffset`（wheel_timer 队列消费位点）、`lastReadTimeMs`（出队读指针）。
 
+### 5.5 TimerWheel 时间轮实现原理深度剖析
+
+RocketMQ 的 TimerWheel **不是** Kafka/Netty 那种分层或环形内存时间轮，而是一个**基于 mmap 文件的固定槽数组**：把时间轴按 `precisionMs` 切格，每格 32 字节，槽里只挂 TimerLog 索引链表的头尾指针。三个关键词：**单层扁平、双倍长度取模复用、mmap 持久化**。
+
+#### 5.5.1 物理结构与槽下标计算
+
+```mermaid
+flowchart TB
+    subgraph File["timerwheel 文件 ≈ 37MB<br/>wheelLength = slotsTotal × 2 × Slot.SIZE"]
+        direction LR
+        S0["Slot[0] 32B"]
+        S1["Slot[1] 32B"]
+        S2["..."]
+        SN["Slot[1209599] 32B"]
+    end
+```
+
+- `slotsTotal = TIMER_WHEEL_TTL_DAY × 86400 = 604800` 个**逻辑槽**（7 天），与精度无关（TimerMessageStore.java:178）
+- 文件却是**两倍**槽数（TimerWheel.java:67），槽下标计算（TimerWheel.java:284-286）：
+
+```java
+public int getSlotIndex(long timeMs) {
+    return (int) (timeMs / precisionMs % (slotsTotal * 2));
+}
+```
+
+**为什么双倍？** 若只用单倍 7 天，今天 10:00 的槽明天 10:00 就被复用——新数据未写、旧数据未清时，出队线程会把昨天的消息误读出来。双倍长度使同一物理槽的两次命中至少相隔 14 天，配合槽内时间戳校验即可识别陈旧数据（TimerWheel.java:269-275）：
+
+```java
+public Slot getSlot(long timeMs) {
+    Slot slot = getRawSlot(timeMs);
+    if (slot.timeMs != timeMs / precisionMs * precisionMs) {
+        return new Slot(-1, -1, -1);   // 槽内时间对不上 → 视为空槽
+    }
+    return slot;
+}
+```
+
+再配合"出队指针最多落后 7 天"（`currReadTimeMs` 落后超 TTL 会被强制追平，TimerMessageStore.java:340-344）的运行时约束，同一时刻的数据在物理上永不重叠冲突。**代价**：停机超过 7 天，恢复后读指针直接跳到"7 天前"，更早的未投递消息被放弃（源码注释明言会丢消息）。
+
+#### 5.5.2 槽与 TimerLog 的链表协作（写入 O(1)，读取 O(n)）
+
+时间轮不存消息也不存列表，每槽只挂一条 TimerLog 记录串成的单向链表：
+
+```mermaid
+flowchart LR
+    subgraph Wheel["TimerWheel"]
+        Slot1["Slot(T)<br/>firstPos=100<br/>lastPos=252<br/>num=3"]
+    end
+    subgraph Log["TimerLog (52B/条)"]
+        R252["记录@252<br/>offsetPy=msgC<br/>prev=176"]
+        R176["记录@176<br/>offsetPy=msgB<br/>prev=100"]
+        R100["记录@100<br/>offsetPy=msgA<br/>prev=-1"]
+    end
+    CL["CommitLog 消息本体"]
+
+    Slot1 -- "lastPos" --> R252
+    R252 -- "prev pos" --> R176
+    R176 -- "prev pos" --> R100
+    R252 -. "offsetPy" .-> CL
+    R176 -. "offsetPy" .-> CL
+    R100 -. "offsetPy" .-> CL
+```
+
+**写入（doEnqueue，头插法）**：`新记录.prev = 槽当前lastPos` → append 到 TimerLog → `putSlot` 更新槽（firstPos 空槽时=本条，lastPos=新位置，num±1）。**槽大小恒定 32B、轮子总大小恒定约 37MB，与挂载消息量无关**——同一时刻百万条消息也只占一个槽。
+
+**读取（dequeue）**：从 `slot.lastPos` 沿 `prev pos` 回溯到 -1，配合 `addFirst` 恢复写入序。
+
+#### 5.5.3 读写路径与持久化
+
+| 方面 | 实现 |
+|---|---|
+| 读写内存 | 全部走 `ThreadLocal` 的堆外 DirectByteBuffer **副本**（`localBuffer`，TimerWheel.java:50-55），不直接操作 mmap，规避读写指针交错 |
+| 定期刷盘 | `TimerFlushService` 调 `flush()`：**逐字节 diff** 副本与 MappedByteBuffer，只写回变化的字节并 `force()`（TimerWheel.java:127-142）——绝大多数槽未变，写放大极小 |
+| 快照 | 5.4.0 新增 `backup()`：副本写 `timerwheel.{offset}` 临时文件 → `ATOMIC_MOVE` 原子改名 → 保留最新两份；重启直接加载快照，避免全量重放 TimerLog（TimerWheel.java:154-229） |
+| 无快照恢复 | 从 checkpoint 位点重放 TimerLog，`reviseSlot()` 幂等修正槽内指针（槽时间不匹配则 force 整槽覆盖） |
+
+#### 5.5.4 轮子的"转动"：双游标驱动
+
+时间轮数组本身是静态的，真正让它"转"的是 `TimerMessageStore` 的两个指针：
+
+- **`currWriteTimeMs`（写边界）**：随时间单调前移（`maybeMoveWriteTime`），入队消息的投递时间必须 ≥ 它，否则视为"已到点"直接旁路投递
+- **`currReadTimeMs`（读指针）**：出队线程逐槽推进，每槽全部处理完才 `moveReadTime()`，追上 `currWriteTimeMs` 即本轮无事可做
+
+超窗口的延迟（超过 `timerRollWindowSlots`）不靠轮子扩容，靠 **MAGIC_ROLL 伪投递 + 重新入轮**（见第 8 章）。
+
+#### 5.5.5 与 Kafka、Netty 时间轮的对比
+
+```mermaid
+flowchart TB
+    subgraph RocketMQ["RocketMQ TimerWheel"]
+        RMQ1["单层扁平数组<br/>604800×2 逻辑槽"] --> RMQ2["槽=32B 只存链表头尾指针<br/>数据在 TimerLog(mmap)"]
+        RMQ2 --> RMQ3["mmap 持久化<br/>diff 刷盘 + 快照"]
+        RMQ3 --> RMQ4["超窗口: ROLL 滚动重投"]
+    end
+    subgraph Kafka["Kafka TimingWheel (分层)"]
+        K1["多层轮: 秒/分/时/天...<br/>每层 1 个 bucket 数组"] --> K2["槽=双向链表<br/>存 TimerTaskEntry 对象"]
+        K2 --> K3["纯内存, 延时队列做兜底<br/>重启后定时任务重建"]
+        K3 --> K4["超层范围: 降级到<br/>SystemTimer 延时队列"]
+    end
+    subgraph Netty["Netty HashedWheelTimer"]
+        N1["单层环形数组<br/>默认 512 槽, tick 100ms"] --> N2["槽=双向链表<br/>存 HashedWheelTimeout"]
+        N2 --> N3["纯内存, 单线程驱动"]
+        N3 --> N4["长延迟: remainingRounds 计数<br/>每轮多转 N 圈"]
+    end
+```
+
+| 维度 | **RocketMQ TimerWheel** | **Kafka 分层时间轮** | **Netty HashedWheelTimer** |
+|---|---|---|---|
+| 结构 | 单层扁平数组（604800×2 槽） | 多层级联（每层一个轮，高层一格=低层一圈） | 单层环形数组（默认 512 槽） |
+| 槽内数据 | 32B，仅链表头尾**文件指针** | 内存双向链表，存任务对象 | 内存双向链表，存 `HashedWheelTimeout` |
+| 时间范围 | 固定 7 天窗口（TTL） | 理论无限（层级可扩展） | 理论无限（rounds 计数） |
+| 长延迟处理 | **ROLL 滚动**：伪投递后重新入轮 | **降级 cascade**：到期时从高层降入低层 | **remainingRounds**：每圈递减，轮到才触发 |
+| 持久化 | mmap 文件 + diff 刷盘 + 快照，**崩溃可恢复** | 纯内存（kafka 的 purgatory 重启靠日志重建） | 纯内存 |
+| 驱动方式 | 双游标（读写指针）+ 出队线程逐槽推进 | 每层一个 DelayQueue 取到期 bucket 推进 | 单 Worker 线程 `waitForNextTick` 逐 tick 推进 |
+| 精度 | `timerPrecisionMs`（默认 1s） | 每层 interval/tick | tickDuration（默认 100ms） |
+| 定位开销 | O(1)：一次取模 + mmap 定位 | O(层数)：逐层 cascade 时 O(1) 均摊 | O(1) |
+| 内存/空间 | 磁盘恒定 ~37MB，与消息量无关 | 堆内存，随任务数线性增长 | 堆内存，随任务数线性增长 |
+| 典型场景 | 百万级持久化定时消息（broker 级） | purgatory 延迟操作（请求超时、限流等） | 连接超时、心跳检测（单进程内海量短定时任务） |
+
+**本质区别的三个层面：**
+
+1. **解决问题域不同**：Kafka/Netty 时间轮管理的是**内存中的任务回调**（到点执行一段代码），进程重启即失效；RocketMQ 时间轮管理的是**持久化消息的投递索引**，必须崩溃可恢复——因此放弃内存链表，选择 mmap 数组 + 追加型 TimerLog，并用 checkpoint/快照刻画恢复边界。
+2. **扩展时间范围的方式不同**：Kafka 用层级（高级数据结构换无限范围）、Netty 用圈数（rounds 换简单性），RocketMQ 两者都不用——固定窗口 + 业务层滚动重投（ROLL），把"无限延迟"翻译成"多次有限延迟"，换来槽定位永远是一次取模。
+3. **数据结构哲学不同**：Kafka/Netty 的槽挂**对象链表**（增加/删除 O(1)，但内存不保序、不持久）；RocketMQ 的槽只挂**文件内偏移量**，链表本体在 TimerLog 中顺序追加——写入是纯顺序 I/O，与 CommitLog 的设计哲学一脉相承，代价是不能随机删除（撤回靠墓碑标记跳过，而非物理删除）。
+
+**为什么不选分层时间轮？** 分层轮的 cascade（高层到期任务降入低层）时机复杂、指针结构难以直接 mmap 持久化、且每次降层是一次随机写。RocketMQ 的场景（消息量巨大、要求持久化、单条延迟上限 3 天）下，"扁平轮 + Roll 滚动 + 追加日志"的组合在实现复杂度、恢复速度和写性能上都是更优解。
+
 ## 6. 入队流程：从 CommitLog 到时间轮
 
 三个队列串联（TimerMessageStore.java:111-113）：`enqueuePutQueue`（TimerRequest）→ 处理 → `dequeuePutQueue` 等下游。
@@ -405,6 +533,46 @@ sequenceDiagram
 - **墓碑消息先于普通消息处理**（dequeue 里先 `deleteList` 后 `normalList`，1086-1105）：配合 `avoidDeleteLose` Map（TimerMessageStore.java:1704,1723-1735）处理"墓碑与原消息同槽"的边界——同槽删除靠 `deleteUniqKeys` 集合匹配，跨槽删除靠 `TIMER_DEL_UNIQKEY` 在出队时命中即丢弃。这是**消息撤回（recall）**的存储基础。
 - **多线程并行**：`dequeueGetMessageThreadNum`（默认3）个线程回读 CommitLog（IO密集），`dequeuePutMessageThreadNum`（默认2）个线程写回（含重试循环）。`splitIntoLists`（TimerMessageStore.java:1123-1154）按 CommitLog 文件边界切分请求列表，让每个回读线程尽量落在同一个 MappedFile 上。
 - **`shouldStartTime`**：出队服务启动延迟（`brokerFastStart`/`shouldStartTime` 配置），避免 Broker 刚启动时 IO 争抢。
+
+### 9.1 "到点"是如何感知的：轮询指针，而非定时器
+
+整个时间轮体系中**没有 JDK Timer、没有 ScheduledExecutor、没有 DelayQueue**——没有任何事件驱动的定时器。时间轮数组是静态的，感知时间流逝的只有一个循环：`TimerDequeueGetService`（单线程）不断比较 `currReadTimeMs`（读指针）与 `currWriteTimeMs`（写边界），一旦当前墙钟时间越过某个槽，就处理那个槽。**定时投递 = 轮询 + 指针以精度为步长追赶墙钟**。
+
+**① 驱动引擎：DequeueGetService 主循环**（TimerMessageStore.java:1544-1570）
+
+```java
+while (!this.isStopped()) {
+    if (System.currentTimeMillis() < shouldStartTime) {   // 启动缓冲
+        waitForRunning(1000);
+        continue;
+    }
+    if (-1 == TimerMessageStore.this.dequeue()) {
+        waitForRunning(100L * precisionMs / 1000);        // 没到点/无数据, 睡一个精度周期
+    }
+    // dequeue()==1 表示处理完一个槽, 不睡立即循环处理下一槽(积压时全速追赶)
+}
+```
+
+**② "到点"的判定本质**：`currWriteTimeMs` 被 `maybeMoveWriteTime()` 用墙钟时间（floor 对齐精度）不断前推；`dequeue()` 开头检查 `currReadTimeMs >= currWriteTimeMs` 则无事可做（返回 -1 去睡）。反过来说，只要读指针落后于写边界，落后的那段槽位的时刻**都已被墙钟越过**——"到点"即 `currReadTimeMs < currWriteTimeMs`。指针以 1 个 `precisionMs` 粒度追赶墙钟，**投递精度由此决定**（默认 1 秒）。
+
+**③ 投递的落点是第二次 CommitLog 写入**：到点槽位取出索引 → 多线程回读消息体 → `convertMessage()` 还原真实 Topic/QueueId → `doPut()` 写回 CommitLog 并建真实 Topic 的 ConsumeQueue 索引——从此它是普通消息，消费者按正常拉取/Pop 流程可见，定时模块功成身退。
+
+**④ 支撑"准时"的四个细节：**
+
+1. **精度提前量补偿**：`transformTimerMessage` 对投递时间 floor 对齐后**再减一个精度**（`deliverMs % precisionMs == 0 时 -= precisionMs`，HookUtils.java:201-205）——把取整损失的时间补回来，保证"不晚于"用户指定时刻投递。
+2. **槽粒度提交保证不重不漏**：`checkDequeueLatch` 等本槽全部请求 `idempotentRelease` 才 `moveReadTime()`。宕机恢复时 `currReadTimeMs` 从 checkpoint 恢复，本槽重做（TimerLog 索引幂等，最多重复投递），已完成的槽绝不重做。
+3. **两个旁路跳过轮子**：入队时已过投递时间的消息（宕机恢复常见）不进轮子，直接进 `dequeuePutQueue` 立即投递（TimerMessageStore.java:1478-1480）；超窗口长延迟靠 MAGIC_ROLL 伪投递滚动（见第 8 章）。
+4. **主从安全**：`isRunningDequeue()` 要求本机为 master（或 slaveActingMaster），从机不出队；切换瞬间置 `dequeueStatusChangeFlag`，本轮作废防丢（TimerMessageStore.java:1106-1109）。
+
+**⑤ 为什么不用"真定时器"方案：**
+
+| 方案 | 到点感知方式 | 问题 |
+|---|---|---|
+| 每消息一个 `ScheduledExecutor`/Timer | 内核定时器回调 | 百万级消息 = 百万定时器，内存/调度开销爆炸 |
+| `DelayQueue`（最小堆） | 堆顶到期 | 全内存、O(log n) 插入、无法持久化 |
+| **RocketMQ：轮询指针** | 读指针逐槽追赶墙钟，槽到 = 消息到 | 延迟 = 精度（1s）+ 排队耗时；换来 O(1) 入轮、恒定内存、全量持久化与崩溃恢复 |
+
+一句话总结：**到点投递 = `TimerDequeueGetService` 以 `precisionMs` 为步长推进 `currReadTimeMs`，追上某个槽即视为"到点"，取出该槽 TimerLog 链表的全部 CommitLog 地址 → 多线程回读消息 → 还原真实 Topic 写回 CommitLog。没有事件驱动的定时器，只有"指针追时钟"的轮询——用秒级精度损失，换取 O(1) 入轮、恒定内存和完整的崩溃恢复能力。**
 
 ## 10. 可靠性与恢复（Recover / Checkpoint）
 
