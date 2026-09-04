@@ -121,6 +121,55 @@ flowchart LR
     DPMS -.-> TFS
 ```
 
+下面这张全景图展示六个线程、三个阻塞队列（含元素类型）与三个存储结构之间的完整交互：
+
+```mermaid
+flowchart LR
+    P["Producer<br/>发送延迟消息"] --> CL["CommitLog<br/>topic改写为wheel_timer"]
+
+    subgraph ENQ["入队阶段 ENQUEUE"]
+        direction LR
+        CQ["ConsumeQueue<br/>rmq_sys_wheel_timer<br/>(queueId=0)"]
+        EGS["① TimerEnqueueGetService<br/>扫描ConsumeQueue"]
+        EPQ["enqueuePutQueue<br/>BlockingQueue&lt;TimerRequest&gt;"]
+        EPS["② TimerEnqueuePutService<br/>计算到期时间"]
+        CQ --> EGS --> EPQ --> EPS
+    end
+
+    CL --> CQ
+    EPS -- "append 52B记录<br/>(prev=slot.lastPos)" --> TL["TimerLog<br/>定时消息索引"]
+    EPS -- "putSlot<br/>firstPos/lastPos/num" --> TW["TimerWheel<br/>Slot槽位数组"]
+    TW -. "slot.lastPos<br/>指向TimerLog记录链" .-> TL
+
+    subgraph DEQ["出队阶段 DEQUEUE"]
+        direction LR
+        DGS["③ TimerDequeueGetService<br/>推进currReadTimeMs<br/>扫描到期槽位"]
+        DGQ["dequeueGetQueue<br/>BlockingQueue&lt;List&lt;TimerRequest&gt;&gt;"]
+        DGMS["⑤ TimerDequeueGetMessageService<br/>按offsetPy回查CommitLog"]
+        DPQ["dequeuePutQueue<br/>BlockingQueue&lt;TimerRequest&gt;<br/>(已带消息体)"]
+        DPMS["⑥ TimerDequeuePutMessageService<br/>还原真实topic重新投递"]
+        DGS --> DGQ --> DGMS --> DPQ --> DPMS
+    end
+
+    TW -- "到期<br/>(currReadTime追上槽位)" --> DGS
+    DGS -- "沿prev pos链<br/>回溯TimerLog" --> TL
+    DGMS -. "回查消息体" .-> CL
+    DPMS -- "第二次写入<br/>还原真实Topic" --> CL2["真实Topic<br/>ConsumeQueue"]
+    CL2 --> C["Consumer<br/>消费到期消息"]
+
+    style P fill:#0f172a,color:#fff
+    style C fill:#0f172a,color:#fff
+    style CL fill:#f1f5f9,stroke:#64748b
+    style TL fill:#f1f5f9,stroke:#b45309
+    style TW fill:#f1f5f9,stroke:#b45309
+    style CL2 fill:#f1f5f9,stroke:#64748b
+    style EPQ fill:#ffcf5c
+    style DGQ fill:#ffcf5c
+    style DPQ fill:#ffcf5c
+```
+
+**图中要点**：三个橙色队列是流水线的"传送带"，均为容量 1024 的有界队列（`enqueuePutQueue`/`dequeuePutQueue` 传单条 `TimerRequest`，`dequeueGetQueue` 按槽批量传 `List<TimerRequest>`）；实线箭头为数据流向，虚线为读取/引用关系（⑤ 回查 CommitLog 取消息体、TimerWheel 槽位指向 TimerLog 链表）。
+
 | # | 线程（类） | 实例数 | 作用 |
 |---|---|---|---|
 | ① | `TimerEnqueueGetService` | 1 | **入队扫描**：循环调用 `enqueue(0)`，从 `rmq_sys_wheel_timer` 的 ConsumeQueue 自 `currQueueOffset` 起迭代，回读 CommitLog 取出 `TIMER_OUT_MS`，构造 `TimerRequest` 塞入 `enqueuePutQueue`（offer 3 秒超时自旋，队满即天然背压）。空轮 `waitForRunning(100 * precisionMs / 1000)`。 |
