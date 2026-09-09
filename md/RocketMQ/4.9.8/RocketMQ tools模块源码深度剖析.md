@@ -64,6 +64,67 @@ graph TD
 
 **Maven 依赖方向**:tools → client → (common, remoting)。tools 对 store/broker 模块仅保留编译期依赖用于个别工具类(如 `QueryConsumeQueueCommand` 使用的常量),运行时通过 `lib/*` 通配 classpath 加载全部 jar。
 
+### 1.1 Maven 模块依赖关系图
+
+以下依赖关系逐一核对自 4.9.8 各模块的 `pom.xml` 声明(非传递依赖):
+
+```mermaid
+graph TD
+    subgraph ToolsPom["tools 模块 pom.xml 直接声明的依赖"]
+        TOOLS["rocketmq-tools<br/>MQAdminStartup / SubCommand<br/>DefaultMQAdminExt"]
+    end
+
+    subgraph InternalDeps["RocketMQ 内部模块"]
+        CLIENT["rocketmq-client<br/>MQClientInstance<br/>MQClientAPIImpl / MQAdminImpl"]
+        ACL["rocketmq-acl<br/>PlainAccessValidator<br/>AclUtils / RPCHook 构建"]
+        SRVUTIL["rocketmq-srvutil<br/>ServerUtil.parseCmdLine<br/>命令行解析公共工具"]
+        COMMON["rocketmq-common<br/>MixAll / 协议头<br/>消息体与常量"]
+        REMOTING["rocketmq-remoting<br/>NettyRemotingClient<br/>RemotingCommand"]
+        LOGGING["rocketmq-logging<br/>InternalLogger 门面"]
+    end
+
+    subgraph ThirdParty["第三方依赖"]
+        FASTJSON["fastjson"]
+        LOGBACK["logback-classic"]
+        LANG3["commons-lang3"]
+        SNAKE["snakeyaml"]
+        CLI["commons-cli<br/>(经 srvutil 传递引入)"]
+    end
+
+    TOOLS -->|MQClientInstance 复用| CLIENT
+    TOOLS -->|"AclUtils.getAclRPCHook<br/>(conf/tools.yml 鉴权)"| ACL
+    TOOLS -->|"ServerUtil.parseCmdLine<br/>(PosixParser 封装)"| SRVUTIL
+    TOOLS -->|消息/Topic/统计数据的 JSON 序列化| FASTJSON
+    TOOLS -->|initLogback 显式配置| LOGBACK
+    TOOLS -->|StringUtils 等| LANG3
+    TOOLS -->|解析 tools.yml ACL 配置| SNAKE
+
+    CLIENT -->|协议类/常量| COMMON
+    ACL --> REMOTING
+    ACL --> LOGGING
+    ACL --> COMMON
+    ACL --> SRVUTIL
+    SRVUTIL --> REMOTING
+    SRVUTIL --> COMMON
+    SRVUTIL -->|"commons-cli 的实际引入方"| CLI
+    COMMON --> REMOTING
+    REMOTING --> LOGGING
+```
+
+各直接依赖在 tools 模块中的**具体用途**(对应源码):
+
+| 依赖 | 用途 |
+|---|---|
+| rocketmq-client | AdminExt 底层复用 `MQClientInstance`/`MQClientAPIImpl`;消息查询走 `MQAdminImpl` |
+| rocketmq-acl | `AclUtils.getAclRPCHook()` 读取 `conf/tools.yml` 构建 ACL 钩子;`PlainAccessConfig` 用于 ACL 管理命令 |
+| rocketmq-srvutil | `ServerUtil.parseCmdLine()` / `buildCommandlineOptions()` 封装 commons-cli 解析;`PrintUtil` 结果格式化 |
+| fastjson | ClusterInfo、TopicStatsTable 等 body 的 JSON 编解码 |
+| logback-classic | `initLogback()` 用 JoranConfigurator 加载 `conf/logback_tools.xml` |
+| commons-lang3 | `StringUtils.split(msgIds, ",")` 等字符串处理 |
+| snakeyaml | 解析 `tools.yml` 中的 ACL 账户配置 |
+
+> 注意 `rocketmq-srvutil` 是一个极小的"胶水"模块,commons-cli 实际由它引入(tools 的 pom 中并未直接声明 commons-cli);`common → remoting` 是 4.9.x 的既有声明(remoting 自身只依赖 logging),与直觉的"remoting 依赖 common"方向相反,属于历史分层遗留。
+
 ## 2. 包结构与职责划分
 
 ```
